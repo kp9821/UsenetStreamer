@@ -27,10 +27,10 @@ UsenetStreamer is a Stremio addon that bridges Prowlarr and NZBDav. It hosts no 
 
 ### Docker Usage
 
-Build the container locally and run it with your environment variables. All configuration is provided via the same vars documented below.
+The image is published to the GitHub Container Registry. Pull it and run with your environment variables:
 
 ```bash
-docker build -t usenetstreamer .
+docker pull ghcr.io/sanket9225/usenetstreamer:latest
 
 docker run -d \
    --name usenetstreamer \
@@ -43,10 +43,12 @@ docker run -d \
    -e NZBDAV_WEBDAV_USER=webdav-username \
    -e NZBDAV_WEBDAV_PASS=webdav-password \
    -e ADDON_BASE_URL=https://myusenet.duckdns.org \
-   usenetstreamer
+   ghcr.io/sanket9225/usenetstreamer:latest
 ```
 
-You can also supply a file with `--env-file /path/to/env` if you prefer not to pass each variable individually.
+If you prefer to keep secrets in a file, use `--env-file /path/to/usenetstreamer.env` instead of specifying `-e` flags.
+
+> Need a custom build? Clone this repo, adjust the code, then run `docker build -t usenetstreamer .` to create your own image.
 
 
 ## Environment Variables
