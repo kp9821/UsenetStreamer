@@ -1125,7 +1125,7 @@ app.get('/manifest.json', (req, res) => {
 
   res.json({
   id: 'com.usenet.streamer',
-  version: '1.0.0',
+  version: '1.1.0',
   name: 'UsenetStreamer',
   description: 'Usenet-powered instant streams for Stremio via Prowlarr/NZBHydra and NZBDav',
   logo: `${ADDON_BASE_URL.replace(/\/$/, '')}/assets/icon.png`,
