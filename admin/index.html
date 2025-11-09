@@ -52,7 +52,7 @@
               <input name="INDEXER_MANAGER_API_KEY" type="text" autocomplete="off" />
             </label>
             <label>Indexer IDs (comma separated)
-              <input name="INDEXER_MANAGER_INDEXERS" type="text" placeholder="-1" />
+              <input name="INDEXER_MANAGER_INDEXERS" type="text" placeholder="-1 or sci-fi,4k" />
             </label>
             <label class="checkbox">
               <input name="INDEXER_MANAGER_STRICT_ID_MATCH" type="checkbox" />
@@ -114,47 +114,11 @@
             <label>NNTP Password
               <input name="NZB_TRIAGE_NNTP_PASS" type="password" autocomplete="new-password" />
             </label>
-            <label>Time Budget (ms)
-              <input name="NZB_TRIAGE_TIME_BUDGET_MS" type="number" min="1000" step="100" />
-            </label>
             <label>Max Candidates
               <input name="NZB_TRIAGE_MAX_CANDIDATES" type="number" min="1" step="1" />
             </label>
-            <label>Preferred Size (GB)
-              <input name="NZB_TRIAGE_PREFERRED_SIZE_GB" type="number" min="0" step="0.1" />
-            </label>
-            <label>Priority Indexers
-              <input name="NZB_TRIAGE_PRIORITY_INDEXERS" type="text" placeholder="9,33" />
-            </label>
-            <label>Download Concurrency
-              <input name="NZB_TRIAGE_DOWNLOAD_CONCURRENCY" type="number" min="1" step="1" />
-            </label>
-            <label>Download Timeout (ms)
-              <input name="NZB_TRIAGE_DOWNLOAD_TIMEOUT_MS" type="number" min="500" step="100" />
-            </label>
             <label>Max NNTP Connections
               <input name="NZB_TRIAGE_MAX_CONNECTIONS" type="number" min="1" step="1" />
-            </label>
-            <label>STAT Timeout (ms)
-              <input name="NZB_TRIAGE_STAT_TIMEOUT_MS" type="number" min="500" step="50" />
-            </label>
-            <label>BODY Timeout (ms)
-              <input name="NZB_TRIAGE_FETCH_TIMEOUT_MS" type="number" min="500" step="50" />
-            </label>
-            <label>Max Parallel NZBs
-              <input name="NZB_TRIAGE_MAX_PARALLEL_NZBS" type="number" min="1" step="1" />
-            </label>
-            <label>STAT Sample Count
-              <input name="NZB_TRIAGE_STAT_SAMPLE_COUNT" type="number" min="0" step="1" />
-            </label>
-            <label>Archive Sample Count
-              <input name="NZB_TRIAGE_ARCHIVE_SAMPLE_COUNT" type="number" min="0" step="1" />
-            </label>
-            <label>Max Decoded Bytes
-              <input name="NZB_TRIAGE_MAX_DECODED_BYTES" type="number" min="1024" step="1024" />
-            </label>
-            <label>Archive Directories (path delimiter separated)
-              <input name="NZB_TRIAGE_ARCHIVE_DIRS" type="text" placeholder="/cache;/another" />
             </label>
           </div>
         </section>

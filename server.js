@@ -22,6 +22,7 @@ app.use('/assets', express.static(path.join(__dirname, 'assets')));
 
 const adminApiRouter = express.Router();
 adminApiRouter.use(express.json({ limit: '1mb' }));
+const adminStatic = express.static(path.join(__dirname, 'admin'));
 
 adminApiRouter.get('/config', (req, res) => {
   const values = collectConfigValues(ADMIN_CONFIG_KEYS);
@@ -111,11 +112,18 @@ function ensureSharedSecret(req, res, next) {
 }
 
 app.use('/admin/api', (req, res, next) => ensureSharedSecret(req, res, next), adminApiRouter);
-app.use('/admin', express.static(path.join(__dirname, 'admin')));
+app.use('/admin', adminStatic);
+app.use('/:token/admin', (req, res, next) => {
+  ensureSharedSecret(req, res, (err) => {
+    if (err) return;
+    adminStatic(req, res, next);
+  });
+});
 
 app.use((req, res, next) => {
   if (req.path.startsWith('/assets/')) return next();
   if (req.path.startsWith('/admin') && !req.path.startsWith('/admin/api')) return next();
+  if (/^\/[^/]+\/admin/.test(req.path) && !/^\/[^/]+\/admin\/api/.test(req.path)) return next();
   return ensureSharedSecret(req, res, next);
 });
 
@@ -2163,7 +2171,7 @@ async function streamHandler(req, res) {
           preferredIndexerIds: preferredIndexerTokens,
           timeBudgetMs: TRIAGE_TIME_BUDGET_MS,
           maxCandidates: TRIAGE_MAX_CANDIDATES,
-          downloadConcurrency: TRIAGE_DOWNLOAD_CONCURRENCY,
+          downloadConcurrency: Math.max(1, TRIAGE_MAX_CANDIDATES),
           downloadTimeoutMs: TRIAGE_DOWNLOAD_TIMEOUT_MS,
           triageOptions: {
             ...TRIAGE_BASE_OPTIONS,

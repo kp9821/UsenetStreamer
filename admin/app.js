@@ -15,6 +15,11 @@
     return localStorage.getItem(storageKey) || '';
   }
 
+  function extractTokenFromPath() {
+    const match = window.location.pathname.match(/^\/([^/]+)\/admin(?:\/|$)/i);
+    return match ? decodeURIComponent(match[1]) : '';
+  }
+
   function setStoredToken(token) {
     if (!token) {
       localStorage.removeItem(storageKey);
@@ -178,9 +183,15 @@
 
   configForm.addEventListener('submit', saveConfiguration);
 
-  const initialToken = getStoredToken();
-  if (initialToken) {
-    setToken(initialToken);
+  const pathToken = extractTokenFromPath();
+  if (pathToken) {
+    setToken(pathToken);
     loadConfiguration();
+  } else {
+    const initialToken = getStoredToken();
+    if (initialToken) {
+      setToken(initialToken);
+      loadConfiguration();
+    }
   }
 })();
