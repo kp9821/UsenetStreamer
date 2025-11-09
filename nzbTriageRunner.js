@@ -4,7 +4,7 @@ const { triageNzbs } = require('./nzbTriage');
 const DEFAULT_TIME_BUDGET_MS = 12000;
 const DEFAULT_MAX_CANDIDATES = 25;
 const DEFAULT_DOWNLOAD_CONCURRENCY = 8;
-const DEFAULT_DOWNLOAD_TIMEOUT_MS = 4000;
+const DEFAULT_DOWNLOAD_TIMEOUT_MS = 10000;
 const TIMEOUT_ERROR_CODE = 'TRIAGE_TIMEOUT';
 
 function normalizeTitle(title) {
