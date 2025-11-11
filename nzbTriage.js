@@ -15,7 +15,8 @@ const DEFAULT_OPTIONS = {
   fetchTimeoutMs: 4000,
   maxDecodedBytes: 16 * 1024,
   nntpMaxConnections: 60,
-  reuseNntpPool: false,
+  reuseNntpPool: true,
+  nntpKeepAliveMs: 120000 ,
   maxParallelNzbs: Number.POSITIVE_INFINITY,
   statSampleCount: 2,
   archiveSampleCount: 1,
@@ -49,18 +50,22 @@ async function triageNzbs(nzbStrings, options = {}) {
   let shouldClosePool = false;
   if (config.nntpConfig && NNTP) {
     const desiredConnections = config.nntpMaxConnections ?? 1;
-    const poolKey = buildPoolKey(config.nntpConfig, desiredConnections);
+    const keepAliveMs = Number.isFinite(config.nntpKeepAliveMs) ? config.nntpKeepAliveMs : 0;
+    const poolKey = buildPoolKey(config.nntpConfig, desiredConnections, keepAliveMs);
     if (config.reuseNntpPool && sharedNntpPoolRecord?.key === poolKey) {
       nntpPool = sharedNntpPoolRecord.pool;
+      if (sharedNntpPoolRecord && typeof sharedNntpPoolRecord.pool?.touch === 'function') {
+        sharedNntpPoolRecord.pool.touch();
+      }
     } else {
       try {
-        const freshPool = await createNntpPool(config.nntpConfig, desiredConnections);
+        const freshPool = await createNntpPool(config.nntpConfig, desiredConnections, { keepAliveMs });
         nntpPool = freshPool;
         if (config.reuseNntpPool) {
           if (sharedNntpPoolRecord?.pool) {
             await sharedNntpPoolRecord.pool.close();
           }
-          sharedNntpPoolRecord = { key: poolKey, pool: freshPool };
+          sharedNntpPoolRecord = { key: poolKey, pool: freshPool, keepAliveMs };
         } else {
           shouldClosePool = true;
         }
@@ -91,6 +96,9 @@ async function triageNzbs(nzbStrings, options = {}) {
   for (const { decision } of results) decisions.push(decision);
 
   if (shouldClosePool && nntpPool) await nntpPool.close();
+  else if (config.reuseNntpPool && nntpPool && typeof nntpPool.touch === 'function') {
+    nntpPool.touch();
+  }
 
   const elapsedMs = Date.now() - start;
   const accepted = decisions.filter((x) => x.decision === 'accept').length;
@@ -645,7 +653,7 @@ function buildDecision(decision, blockers, warnings, meta) {
   };
 }
 
-function statSegment(pool, segmentId, timeoutMs) {
+function statSegment(pool, segmentId, timeoutMs, attempt = 0) {
   if (currentMetrics) currentMetrics.statCalls += 1;
   const start = Date.now();
   return runWithClient(pool, (client) => statSegmentWithClient(client, segmentId, timeoutMs))
@@ -654,10 +662,15 @@ function statSegment(pool, segmentId, timeoutMs) {
       return result;
     })
     .catch((err) => {
+      const isTimeout = err?.code === 'STAT_TIMEOUT';
       if (currentMetrics) {
-        if (err?.code === 'STAT_TIMEOUT') currentMetrics.statTimeouts += 1;
+        if (isTimeout) currentMetrics.statTimeouts += 1;
         else if (err?.code === 'STAT_MISSING' || err?.code === 430) currentMetrics.statMissing += 1;
         else currentMetrics.statErrors += 1;
+      }
+      if (isTimeout && attempt === 0) {
+        const extended = Math.max(timeoutMs * 2, timeoutMs + 1000);
+        return statSegment(pool, segmentId, extended, attempt + 1);
       }
       throw err;
     })
@@ -692,7 +705,7 @@ function statSegmentWithClient(client, segmentId, timeoutMs) {
   });
 }
 
-function fetchSegmentBody(pool, segmentId, timeoutMs) {
+function fetchSegmentBody(pool, segmentId, timeoutMs, attempt = 0) {
   if (currentMetrics) currentMetrics.bodyCalls += 1;
   const start = Date.now();
   return runWithClient(pool, (client) => fetchSegmentBodyWithClient(client, segmentId, timeoutMs))
@@ -701,10 +714,15 @@ function fetchSegmentBody(pool, segmentId, timeoutMs) {
       return result;
     })
     .catch((err) => {
+      const isTimeout = err?.code === 'BODY_TIMEOUT';
       if (currentMetrics) {
-        if (err?.code === 'BODY_TIMEOUT') currentMetrics.bodyTimeouts += 1;
+        if (isTimeout) currentMetrics.bodyTimeouts += 1;
         else if (err?.code === 'BODY_MISSING') currentMetrics.bodyMissing += 1;
         else currentMetrics.bodyErrors += 1;
+      }
+      if (isTimeout && attempt === 0) {
+        const extended = Math.max(timeoutMs * 2, timeoutMs + 1000);
+        return fetchSegmentBody(pool, segmentId, extended, attempt + 1);
       }
       throw err;
     })
@@ -747,9 +765,10 @@ function fetchSegmentBodyWithClient(client, segmentId, timeoutMs) {
   });
 }
 
-async function createNntpPool(config, maxConnections) {
+async function createNntpPool(config, maxConnections, options = {}) {
   const numeric = Number.isFinite(maxConnections) ? Math.floor(maxConnections) : 1;
   const connectionCount = Math.max(1, numeric);
+  const keepAliveMs = Number.isFinite(options.keepAliveMs) && options.keepAliveMs > 0 ? options.keepAliveMs : 0;
 
   const connectTasks = Array.from({ length: connectionCount }, () => createNntpClient(config));
   let initialClients = [];
@@ -770,6 +789,12 @@ async function createNntpPool(config, maxConnections) {
   const waiters = [];
   const allClients = new Set(initialClients);
   let closing = false;
+  let lastUsed = Date.now();
+  let keepAliveTimer = null;
+
+  const touch = () => {
+    lastUsed = Date.now();
+  };
 
   const attemptReplacement = () => {
     if (closing) return;
@@ -778,9 +803,12 @@ async function createNntpPool(config, maxConnections) {
         const replacement = await createNntpClient(config);
         allClients.add(replacement);
         if (waiters.length > 0) {
-          waiters.shift()(replacement);
+          const waiter = waiters.shift();
+          touch();
+          waiter(replacement);
         } else {
           idle.push(replacement);
+          touch();
         }
       } catch (createErr) {
         console.warn('[NZB TRIAGE] Failed to create replacement NNTP client', createErr?.message || createErr);
@@ -814,9 +842,12 @@ async function createNntpPool(config, maxConnections) {
       return;
     }
     if (waiters.length > 0) {
-      waiters.shift()(client);
+      const waiter = waiters.shift();
+      touch();
+      waiter(client);
     } else {
       idle.push(client);
+      touch();
     }
   };
 
@@ -826,11 +857,27 @@ async function createNntpPool(config, maxConnections) {
       return;
     }
     if (idle.length > 0) {
-      resolve(idle.pop());
+      const client = idle.pop();
+      touch();
+      resolve(client);
     } else {
       waiters.push(resolve);
     }
   });
+
+  if (keepAliveMs > 0) {
+    keepAliveTimer = setInterval(() => {
+      if (closing) return;
+      if (Date.now() - lastUsed < keepAliveMs) return;
+      if (waiters.length > 0) return;
+      if (idle.length === 0) return;
+      const client = idle.pop();
+      if (!client) return;
+      scheduleReplacement(client);
+      touch();
+    }, keepAliveMs);
+    if (typeof keepAliveTimer.unref === 'function') keepAliveTimer.unref();
+  }
 
   return {
     size: connectionCount,
@@ -841,11 +888,18 @@ async function createNntpPool(config, maxConnections) {
     },
     async close() {
       closing = true;
+      if (keepAliveTimer) {
+        clearInterval(keepAliveTimer);
+      }
       const clientsToClose = Array.from(allClients);
       allClients.clear();
       idle.length = 0;
       waiters.splice(0, waiters.length).forEach((resolve) => resolve(null));
       await Promise.all(clientsToClose.map((client) => closeNntpClient(client)));
+    },
+    touch,
+    getLastUsed() {
+      return lastUsed;
     },
   };
 }
@@ -853,6 +907,7 @@ async function createNntpPool(config, maxConnections) {
 async function runWithClient(pool, handler) {
   if (!pool) throw new Error('NNTP pool unavailable');
   const client = await pool.acquire();
+  if (!client) throw new Error('NNTP client unavailable');
   let dropClient = false;
   try {
     return await handler(client);
@@ -1016,13 +1071,14 @@ function buildErrorDecision(err, nzbIndex) {
   });
 }
 
-function buildPoolKey(config, connections) {
+function buildPoolKey(config, connections, keepAliveMs = 0) {
   return [
     config.host,
     config.port ?? 119,
     config.user ?? '',
     config.useTLS ? 'tls' : 'plain',
     connections,
+    keepAliveMs,
   ].join('|');
 }
 
