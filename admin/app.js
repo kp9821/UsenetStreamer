@@ -163,6 +163,7 @@
     try {
       const data = await apiRequest('/admin/api/config');
       populateForm(data.values || {});
+      syncHealthControls();
       configSection.classList.remove('hidden');
       updateManifestLink(data.manifestUrl || '');
       runtimeEnvPath = data.runtimeEnvPath || null;
@@ -237,6 +238,44 @@
     }, 2500);
   }
 
+  const healthToggle = configForm.querySelector('input[name="NZB_TRIAGE_ENABLED"]');
+  const healthRequiredFields = Array.from(configForm.querySelectorAll('[data-health-required]'));
+  const triageCandidateSelect = configForm.querySelector('select[name="NZB_TRIAGE_MAX_CANDIDATES"]');
+  const triageConnectionsInput = configForm.querySelector('input[name="NZB_TRIAGE_MAX_CONNECTIONS"]');
+
+  function updateHealthFieldRequirements() {
+    const enabled = Boolean(healthToggle?.checked);
+    healthRequiredFields.forEach((field) => {
+      if (!field) return;
+      if (enabled) field.setAttribute('required', 'required');
+      else field.removeAttribute('required');
+    });
+  }
+
+  function getConnectionLimit() {
+    const candidateCount = Number(triageCandidateSelect?.value) || 0;
+    return candidateCount > 0 ? candidateCount * 2 : null;
+  }
+
+  function enforceConnectionLimit() {
+    if (!triageConnectionsInput) return;
+    const maxAllowed = getConnectionLimit();
+    if (maxAllowed && Number.isFinite(maxAllowed)) {
+      triageConnectionsInput.max = String(maxAllowed);
+      const current = Number(triageConnectionsInput.value);
+      if (Number.isFinite(current) && current > maxAllowed) {
+        triageConnectionsInput.value = String(maxAllowed);
+      }
+    } else {
+      triageConnectionsInput.removeAttribute('max');
+    }
+  }
+
+  function syncHealthControls() {
+    updateHealthFieldRequirements();
+    enforceConnectionLimit();
+  }
+
   async function saveConfiguration(event) {
     event.preventDefault();
     saveStatus.textContent = '';
@@ -285,6 +324,18 @@
     copyManifestButton.addEventListener('click', copyManifestUrl);
   }
 
+  if (healthToggle) {
+    healthToggle.addEventListener('change', syncHealthControls);
+  }
+  if (triageCandidateSelect) {
+    triageCandidateSelect.addEventListener('change', () => {
+      enforceConnectionLimit();
+    });
+  }
+  if (triageConnectionsInput) {
+    triageConnectionsInput.addEventListener('input', enforceConnectionLimit);
+  }
+
   const pathToken = extractTokenFromPath();
   if (pathToken) {
     setToken(pathToken);
@@ -296,4 +347,5 @@
       loadConfiguration();
     }
   }
+  syncHealthControls();
 })();

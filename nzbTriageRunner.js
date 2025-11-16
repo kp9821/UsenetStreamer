@@ -8,8 +8,21 @@ const DEFAULT_DOWNLOAD_TIMEOUT_MS = 30000;
 const TIMEOUT_ERROR_CODE = 'TRIAGE_TIMEOUT';
 
 function normalizeTitle(title) {
-  if (!title) return '';
-  return title.toString().trim().toLowerCase();
+  if (title === undefined || title === null) return '';
+  const raw = title.toString().trim();
+  if (!raw) return '';
+
+  let working = raw.replace(/\.(nzb|zip)$/i, '');
+  working = working
+    .replace(/[._-]+/g, ' ')
+    .replace(/['"`]+/g, ' ')
+    .replace(/[()\[\]{}]/g, ' ')
+    .replace(/[^a-z0-9\s]+/gi, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+    .toLowerCase();
+
+  return working;
 }
 
 function logEvent(logger, level, message, context) {
@@ -135,6 +148,7 @@ async function triageAndRank(nzbResults, options = {}) {
   const maxCandidates = Math.max(1, options.maxCandidates ?? DEFAULT_MAX_CANDIDATES);
   const logger = options.logger;
   const triageOptions = { ...(options.triageOptions || {}) };
+  const captureNzbPayloads = Boolean(options.captureNzbPayloads);
 
   const builtCandidates = buildCandidates(nzbResults);
   const constrainedCandidates = allowedIndexerSet.size > 0
@@ -324,6 +338,9 @@ async function triageAndRank(nzbResults, options = {}) {
         const firstDecision = summary?.decisions?.[0];
         if (firstDecision) {
           const summarized = summarizeDecision(firstDecision);
+          if (captureNzbPayloads && summarized.status === 'verified') {
+            summarized.nzbPayload = nzbPayload;
+          }
           decisionMap.set(downloadUrl, attachMetadata(downloadUrl, summarized));
           evaluatedCount += 1;
         } else {

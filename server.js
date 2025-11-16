@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const express = require('express');
 const axios = require('axios');
+const FormData = require('form-data');
 const cors = require('cors');
 const fs = require('fs');
 const { pipeline } = require('stream');
@@ -70,6 +71,7 @@ adminApiRouter.post('/config', (req, res) => {
   try {
     runtimeEnv.updateRuntimeEnv(updates);
     runtimeEnv.applyRuntimeEnv();
+    clearAllCaches('admin-config-save');
   } catch (error) {
     console.error('[ADMIN] Failed to update configuration', error);
     res.status(500).json({ error: 'Failed to persist configuration changes' });
@@ -437,8 +439,248 @@ const STREAM_HIGH_WATER_MARK = (() => {
 const CINEMETA_URL = 'https://v3-cinemeta.strem.io/meta';
 const pipelineAsync = promisify(pipeline);
 
+const STREAM_CACHE_TTL_MS = (() => {
+  const raw = Number(process.env.STREAM_CACHE_TTL_MS);
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return 5 * 60 * 1000;
+})();
+const STREAM_CACHE_MAX_ENTRIES = toPositiveInt(process.env.STREAM_CACHE_MAX_ENTRIES, 200);
+const STREAM_CACHE_MAX_BYTES = toPositiveInt(process.env.STREAM_CACHE_MAX_BYTES, 25 * 1024 * 1024);
+const streamResponseCache = new Map();
+let streamCacheBytes = 0;
+
+const VERIFIED_NZB_CACHE_MAX_BYTES = toPositiveInt(process.env.VERIFIED_NZB_CACHE_MAX_BYTES, 200 * 1024 * 1024);
+const VERIFIED_NZB_CACHE_TTL_MS = (() => {
+  const raw = Number(process.env.VERIFIED_NZB_CACHE_TTL_MS);
+  if (Number.isFinite(raw) && raw >= 0) return raw;
+  return 60 * 60 * 1000;
+})();
+const verifiedNzbCacheByUrl = new Map();
+let verifiedNzbCacheBytes = 0;
+
+
 const posixPath = path.posix;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function estimateCacheEntrySize(payload, meta) {
+  try {
+    return Buffer.byteLength(JSON.stringify({ payload, meta }));
+  } catch (error) {
+    return 0;
+  }
+}
+
+function cleanupStreamCache(now = Date.now()) {
+  if (streamResponseCache.size === 0) return;
+  if (STREAM_CACHE_TTL_MS > 0) {
+    for (const [key, entry] of streamResponseCache.entries()) {
+      if (entry.expiresAt && entry.expiresAt <= now) {
+        streamResponseCache.delete(key);
+        streamCacheBytes -= entry.size;
+      }
+    }
+  }
+  while (
+    (STREAM_CACHE_MAX_BYTES > 0 && streamCacheBytes > STREAM_CACHE_MAX_BYTES)
+    || (STREAM_CACHE_MAX_ENTRIES > 0 && streamResponseCache.size > STREAM_CACHE_MAX_ENTRIES)
+  ) {
+    const oldestKey = streamResponseCache.keys().next().value;
+    if (!oldestKey) break;
+    const oldest = streamResponseCache.get(oldestKey);
+    streamResponseCache.delete(oldestKey);
+    if (oldest) streamCacheBytes -= oldest.size;
+  }
+}
+
+function clearStreamResponseCache(reason = 'manual') {
+  if (streamResponseCache.size > 0) {
+    console.log('[CACHE] Cleared stream response cache', { reason, entries: streamResponseCache.size });
+  }
+  streamResponseCache.clear();
+  streamCacheBytes = 0;
+}
+
+function getStreamCacheEntry(cacheKey) {
+  if (!cacheKey || STREAM_CACHE_MAX_ENTRIES <= 0) return null;
+  cleanupStreamCache();
+  const entry = streamResponseCache.get(cacheKey);
+  if (!entry) return null;
+  if (entry.expiresAt && entry.expiresAt <= Date.now()) {
+    streamResponseCache.delete(cacheKey);
+    streamCacheBytes -= entry.size;
+    return null;
+  }
+  return entry;
+}
+
+function setStreamCacheEntry(cacheKey, payload, meta = null) {
+  if (!cacheKey || STREAM_CACHE_MAX_ENTRIES <= 0) return;
+  const size = estimateCacheEntrySize(payload, meta);
+  if (size <= 0 || (STREAM_CACHE_MAX_BYTES > 0 && size > STREAM_CACHE_MAX_BYTES)) return;
+  const expiresAt = STREAM_CACHE_TTL_MS > 0 ? Date.now() + STREAM_CACHE_TTL_MS : null;
+  const existing = streamResponseCache.get(cacheKey);
+  if (existing) {
+    streamCacheBytes -= existing.size;
+    streamResponseCache.delete(cacheKey);
+  }
+  streamResponseCache.set(cacheKey, { payload, meta, expiresAt, size });
+  streamCacheBytes += size;
+  cleanupStreamCache();
+}
+
+function cleanupVerifiedNzbCache(now = Date.now()) {
+  if (verifiedNzbCacheByUrl.size === 0) return;
+  if (VERIFIED_NZB_CACHE_TTL_MS > 0) {
+    for (const [url, entry] of verifiedNzbCacheByUrl.entries()) {
+      if (entry.expiresAt && entry.expiresAt <= now) {
+        verifiedNzbCacheByUrl.delete(url);
+        verifiedNzbCacheBytes -= entry.size;
+      }
+    }
+  }
+  while (VERIFIED_NZB_CACHE_MAX_BYTES > 0 && verifiedNzbCacheBytes > VERIFIED_NZB_CACHE_MAX_BYTES) {
+    const oldestKey = verifiedNzbCacheByUrl.keys().next().value;
+    if (!oldestKey) break;
+    const oldest = verifiedNzbCacheByUrl.get(oldestKey);
+    verifiedNzbCacheByUrl.delete(oldestKey);
+    if (oldest) verifiedNzbCacheBytes -= oldest.size;
+  }
+}
+
+function getVerifiedNzbCacheEntry(downloadUrl) {
+  if (!downloadUrl || VERIFIED_NZB_CACHE_MAX_BYTES <= 0) return null;
+  cleanupVerifiedNzbCache();
+  const entry = verifiedNzbCacheByUrl.get(downloadUrl);
+  if (!entry) return null;
+  if (entry.expiresAt && entry.expiresAt <= Date.now()) {
+    verifiedNzbCacheByUrl.delete(downloadUrl);
+    verifiedNzbCacheBytes -= entry.size;
+    return null;
+  }
+  entry.lastAccess = Date.now();
+  return entry;
+}
+
+function cacheVerifiedNzbPayload(downloadUrl, nzbPayload, metadata = {}) {
+  if (!downloadUrl || typeof nzbPayload !== 'string' || nzbPayload.length === 0) return;
+  if (VERIFIED_NZB_CACHE_MAX_BYTES <= 0) return;
+  const payloadBuffer = Buffer.from(nzbPayload, 'utf8');
+  const size = payloadBuffer.length;
+  if (size > VERIFIED_NZB_CACHE_MAX_BYTES) return;
+  const expiresAt = VERIFIED_NZB_CACHE_TTL_MS > 0 ? Date.now() + VERIFIED_NZB_CACHE_TTL_MS : null;
+  const existing = verifiedNzbCacheByUrl.get(downloadUrl);
+  if (existing) {
+    verifiedNzbCacheBytes -= existing.size;
+  }
+  verifiedNzbCacheByUrl.set(downloadUrl, {
+    downloadUrl,
+    payloadBuffer,
+    size,
+    metadata: {
+      title: metadata.title || null,
+      sizeBytes: metadata.size || null,
+      fileName: metadata.fileName || null,
+    },
+    expiresAt,
+    createdAt: Date.now(),
+    lastAccess: Date.now(),
+  });
+  verifiedNzbCacheBytes += size;
+  cleanupVerifiedNzbCache();
+}
+
+function clearVerifiedNzbCache(reason = 'manual') {
+  if (verifiedNzbCacheByUrl.size > 0) {
+    console.log('[CACHE] Cleared verified NZB cache', { reason, entries: verifiedNzbCacheByUrl.size });
+  }
+  verifiedNzbCacheByUrl.clear();
+  verifiedNzbCacheBytes = 0;
+}
+
+function buildVerifiedNzbFileName(entry, fallbackTitle = null) {
+  const preferred = entry?.metadata?.fileName || entry?.metadata?.title || fallbackTitle || 'verified-nzb';
+  const sanitized = preferred
+    .toString()
+    .replace(/[^a-z0-9]+/gi, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 120) || 'verified-nzb';
+  return sanitized.toLowerCase().endsWith('.nzb') ? sanitized : `${sanitized}.nzb`;
+}
+
+function buildStreamCacheKey({ type, id, query = {}, requestedEpisode = null }) {
+  const normalizedQuery = {};
+  Object.keys(query)
+    .sort()
+    .forEach((key) => {
+      normalizedQuery[key] = query[key];
+    });
+  const normalizedEpisode = requestedEpisode
+    ? {
+        season: Number.isFinite(requestedEpisode.season) ? requestedEpisode.season : null,
+        episode: Number.isFinite(requestedEpisode.episode) ? requestedEpisode.episode : null,
+      }
+    : null;
+  return JSON.stringify({ type, id, requestedEpisode: normalizedEpisode, query: normalizedQuery });
+}
+
+
+function triageDecisionsMatchStatuses(decisionMap, candidates, allowedStatuses) {
+  if (!decisionMap || !candidates || candidates.length === 0) return false;
+  for (const candidate of candidates) {
+    const decision = decisionMap.get(candidate.downloadUrl);
+    if (!decision || !allowedStatuses.has(decision.status)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function sanitizeDecisionForCache(decision) {
+  if (!decision) return null;
+  return {
+    status: decision.status || 'unknown',
+    blockers: Array.isArray(decision.blockers) ? decision.blockers : [],
+    warnings: Array.isArray(decision.warnings) ? decision.warnings : [],
+    fileCount: decision.fileCount ?? null,
+    nzbIndex: decision.nzbIndex ?? null,
+    archiveFindings: Array.isArray(decision.archiveFindings) ? decision.archiveFindings : [],
+    title: decision.title || null,
+    normalizedTitle: decision.normalizedTitle || null,
+    indexerId: decision.indexerId || null,
+    indexerName: decision.indexerName || null,
+  };
+}
+
+function serializeFinalNzbResults(results) {
+  if (!Array.isArray(results)) return [];
+  return results.map((result) => ({
+    downloadUrl: result.downloadUrl,
+    title: result.title,
+    size: result.size,
+    indexerId: result.indexerId,
+    indexer: result.indexer,
+    guid: result.guid,
+    _sourceType: result._sourceType,
+    age: result.age,
+  }));
+}
+
+function restoreFinalNzbResults(serialized) {
+  if (!Array.isArray(serialized)) return [];
+  return serialized
+    .filter((entry) => entry && entry.downloadUrl)
+    .map((entry) => ({ ...entry }));
+}
+
+function restoreTriageDecisions(snapshot) {
+  const map = new Map();
+  if (!Array.isArray(snapshot)) return map;
+  snapshot.forEach(([downloadUrl, decision]) => {
+    if (!downloadUrl || !decision) return;
+    map.set(downloadUrl, { ...decision });
+  });
+  return map;
+}
 
 const nzbdavStreamCache = new Map();
 const NZBDAV_VIDEO_EXTENSIONS = new Set([
@@ -500,21 +742,49 @@ function ensureAddonConfigured() {
 
 const isUsingProwlarr = () => INDEXER_MANAGER === 'prowlarr';
 const isUsingNzbhydra = () => INDEXER_MANAGER === 'nzbhydra';
+const PROWLARR_SEARCH_LIMIT = 1000;
+
+function buildProwlarrIndexerIdList() {
+  if (!INDEXER_MANAGER_INDEXERS) return null;
+  if (INDEXER_MANAGER_INDEXERS === '-1') return ['-1'];
+  const tokens = INDEXER_MANAGER_INDEXERS.split(',')
+    .map((token) => token.trim())
+    .filter((token) => token.length > 0);
+  return tokens.length > 0 ? tokens : null;
+}
 
 function buildProwlarrSearchParams(plan) {
   return {
-    limit: '25',
+    limit: String(PROWLARR_SEARCH_LIMIT),
     offset: '0',
     type: plan.type,
     query: plan.query,
-    indexerIds: INDEXER_MANAGER_INDEXERS || undefined
+    indexerIdsList: buildProwlarrIndexerIdList()
   };
 }
 
 async function executeProwlarrSearch(plan) {
   const params = buildProwlarrSearchParams(plan);
-  const response = await axios.get(`${INDEXER_MANAGER_BASE_URL}/api/v1/search`, {
-    params,
+  const urlSearchParams = new URLSearchParams();
+  Object.entries(params).forEach(([key, value]) => {
+    if (value === undefined || value === null) return;
+    if (key === 'indexerIdsList' && Array.isArray(value)) {
+      value.forEach((id) => {
+        if (id !== undefined && id !== null && String(id).length > 0) {
+          urlSearchParams.append('indexerIds', String(id));
+        }
+      });
+    } else {
+      urlSearchParams.append(key, String(value));
+    }
+  });
+  const serializedParams = urlSearchParams.toString();
+  const requestUrl = `${INDEXER_MANAGER_BASE_URL}/api/v1/search`;
+  const fullUrl = serializedParams ? `${requestUrl}?${serializedParams}` : requestUrl;
+  console.log('[PROWLARR] Requesting search', {
+    url: fullUrl,
+  });
+  const response = await axios.get(fullUrl, {
     headers: { 'X-Api-Key': INDEXER_MANAGER_API_KEY },
     timeout: 60000
   });
@@ -798,20 +1068,86 @@ function buildNzbdavApiParams(mode, extra = {}) {
   };
 }
 
-async function addNzbToNzbdav(nzbUrl, category, jobLabel) {
+function extractNzbdavQueueId(payload) {
+  return payload?.nzo_id
+    || payload?.nzoId
+    || payload?.NzoId
+    || (Array.isArray(payload?.nzo_ids) && payload.nzo_ids[0])
+    || (Array.isArray(payload?.queue) && payload.queue[0]?.nzo_id)
+    || null;
+}
+
+async function addNzbToNzbdav({ downloadUrl, cachedEntry = null, category, jobLabel }) {
   ensureNzbdavConfigured();
 
-  if (!nzbUrl) {
-    throw new Error('Missing NZB download URL');
-  }
   if (!category) {
     throw new Error('Missing NZBDav category');
   }
+  if (!downloadUrl && !cachedEntry) {
+    throw new Error('Missing NZB source');
+  }
 
-  console.log(`[NZBDAV] Queueing NZB for category=${category} (${jobLabel || 'untitled'})`);
+  const jobLabelDisplay = jobLabel || 'untitled';
+  if (cachedEntry?.payloadBuffer) {
+    try {
+      console.log(`[NZBDAV] Queueing cached NZB payload via addfile (${jobLabelDisplay})`);
+      const form = new FormData();
+      const uploadName = buildVerifiedNzbFileName(cachedEntry, jobLabel);
+      form.append('nzbfile', cachedEntry.payloadBuffer, {
+        filename: uploadName,
+        contentType: 'application/x-nzb+xml'
+      });
+
+      const headers = {
+        ...form.getHeaders(),
+      };
+      if (NZBDAV_API_KEY) {
+        headers['x-api-key'] = NZBDAV_API_KEY;
+      }
+
+      const params = buildNzbdavApiParams('addfile', {
+        cat: category,
+        nzbname: jobLabel || undefined,
+        output: 'json'
+      });
+
+      const response = await axios.post(`${NZBDAV_URL}/api`, form, {
+        params,
+        timeout: NZBDAV_API_TIMEOUT_MS,
+        headers,
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+        validateStatus: (status) => status < 500,
+      });
+
+      if (!response.data?.status) {
+        const errorMessage = response.data?.error || `addfile returned status ${response.status}`;
+        throw new Error(errorMessage);
+      }
+
+      const nzoId = extractNzbdavQueueId(response.data);
+      if (!nzoId) {
+        throw new Error('addfile succeeded but no nzo_id returned');
+      }
+
+      console.log(`[NZBDAV] NZB queued with id ${nzoId} (uploaded payload)`);
+      return { nzoId };
+    } catch (error) {
+      if (!downloadUrl) {
+        throw new Error(`[NZBDAV] Failed to upload cached NZB: ${error.message}`);
+      }
+      console.warn(`[NZBDAV] addfile failed, falling back to addurl: ${error.message}`);
+    }
+  }
+
+  if (!downloadUrl) {
+    throw new Error('Unable to queue NZB: no download URL available');
+  }
+
+  console.log(`[NZBDAV] Queueing NZB via addurl for category=${category} (${jobLabelDisplay})`);
 
   const params = buildNzbdavApiParams('addurl', {
-    name: nzbUrl,
+    name: downloadUrl,
     cat: category,
     nzbname: jobLabel || undefined,
     output: 'json'
@@ -834,11 +1170,7 @@ async function addNzbToNzbdav(nzbUrl, category, jobLabel) {
     throw new Error(`[NZBDAV] Failed to queue NZB: ${errorMessage}`);
   }
 
-  const nzoId = response.data?.nzo_id ||
-                response.data?.nzoId ||
-                response.data?.NzoId ||
-                (Array.isArray(response.data?.nzo_ids) && response.data.nzo_ids[0]) ||
-                (Array.isArray(response.data?.queue) && response.data.queue[0]?.nzo_id);
+  const nzoId = extractNzbdavQueueId(response.data);
 
   if (!nzoId) {
     throw new Error('[NZBDAV] addurl succeeded but no nzo_id returned');
@@ -1056,8 +1388,21 @@ function inferMimeType(fileName) {
 }
 
 function normalizeReleaseTitle(title) {
-  if (!title) return '';
-  return title.toString().trim().toLowerCase();
+  if (title === undefined || title === null) return '';
+  const raw = title.toString().trim();
+  if (!raw) return '';
+
+  let working = raw.replace(/\.(nzb|zip)$/i, '');
+  working = working
+    .replace(/[._-]+/g, ' ')
+    .replace(/['"`]+/g, ' ')
+    .replace(/[()\[\]{}]/g, ' ')
+    .replace(/[^a-z0-9\s]+/gi, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+    .toLowerCase();
+
+  return working;
 }
 
 function normalizeIndexerToken(value) {
@@ -1119,6 +1464,37 @@ function buildTriageTitleMap(decisions) {
   });
 
   return titleMap;
+}
+
+function prioritizeTriageCandidates(results, preferredSizeBytes, maxCandidates) {
+  if (!Array.isArray(results) || results.length === 0) return [];
+  const buckets = new Map();
+  results.forEach((result, index) => {
+    if (!result) return;
+    const normalizedTitle = normalizeReleaseTitle(result.title) || result.downloadUrl;
+    const size = Number.isFinite(Number(result.size)) ? Number(result.size) : null;
+    const sizeDiff = Number.isFinite(preferredSizeBytes) && Number.isFinite(size)
+      ? Math.abs(size - preferredSizeBytes)
+      : Number.isFinite(size)
+        ? 0
+        : Number.MAX_SAFE_INTEGER;
+    const current = buckets.get(normalizedTitle);
+    if (!current || sizeDiff < current.sizeDiff) {
+      buckets.set(normalizedTitle, {
+        result,
+        sizeDiff,
+        index
+      });
+    }
+  });
+
+  return Array.from(buckets.values())
+    .sort((a, b) => {
+      if (a.sizeDiff !== b.sizeDiff) return a.sizeDiff - b.sizeDiff;
+      return a.index - b.index;
+    })
+    .slice(0, Math.max(1, maxCandidates))
+    .map((entry) => entry.result);
 }
 
 async function fetchCompletedNzbdavHistory(categories = []) {
@@ -1393,6 +1769,19 @@ function cleanupNzbdavCache() {
   }
 }
 
+function clearNzbdavStreamCache(reason = 'manual') {
+  if (nzbdavStreamCache.size > 0) {
+    console.log('[CACHE] Cleared NZBDav stream cache', { reason, entries: nzbdavStreamCache.size });
+  }
+  nzbdavStreamCache.clear();
+}
+
+function clearAllCaches(reason = 'manual') {
+  clearStreamResponseCache(reason);
+  clearVerifiedNzbCache(reason);
+  clearNzbdavStreamCache(reason);
+}
+
 async function getOrCreateNzbdavStream(cacheKey, builder) {
   cleanupNzbdavCache();
   const existing = nzbdavStreamCache.get(cacheKey);
@@ -1460,7 +1849,16 @@ async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisod
         slotJobName = slot?.job_name || slot?.JobName || slot?.name || slot?.Name || existingSlot?.jobName || title;
         console.log(`[NZBDAV] Reusing completed NZB ${slotJobName} (${nzoId})`);
       } else {
-        const added = await addNzbToNzbdav(downloadUrl, category, title);
+        const cachedNzbEntry = getVerifiedNzbCacheEntry(downloadUrl);
+        if (cachedNzbEntry) {
+          console.log('[CACHE] Using verified NZB payload', { downloadUrl });
+        }
+        const added = await addNzbToNzbdav({
+          downloadUrl,
+          cachedEntry: cachedNzbEntry,
+          category,
+          jobLabel: title,
+        });
         nzoId = added.nzoId;
         slot = await waitForNzbdavHistorySlot(nzoId, category);
         slotCategory = slot?.category || slot?.Category || category;
@@ -1810,6 +2208,42 @@ async function streamHandler(req, res) {
     ensureNzbdavConfigured();
 
     const requestedEpisode = parseRequestedEpisode(type, id, req.query || {});
+    const streamCacheKey = STREAM_CACHE_MAX_ENTRIES > 0
+      ? buildStreamCacheKey({ type, id, requestedEpisode, query: req.query || {} })
+      : null;
+    let cachedStreamEntry = null;
+    let cachedSearchMeta = null;
+    if (streamCacheKey) {
+      cachedStreamEntry = getStreamCacheEntry(streamCacheKey);
+      if (cachedStreamEntry) {
+        if (!cachedStreamEntry.meta || cachedStreamEntry.meta.triageComplete) {
+          console.log('[CACHE] Stream cache hit', { type, id, triageComplete: cachedStreamEntry.meta?.triageComplete !== false });
+          res.json(cachedStreamEntry.payload);
+          return;
+        }
+        if (cachedStreamEntry.meta?.version === 1 && Array.isArray(cachedStreamEntry.meta.finalNzbResults)) {
+          cachedSearchMeta = cachedStreamEntry.meta;
+          console.log('[CACHE] Reusing cached search results for pending triage', {
+            type,
+            id,
+            pending: cachedSearchMeta.triagePendingDownloadUrls?.length || 0,
+          });
+        } else {
+          console.log('[CACHE] Entry missing usable metadata; ignoring context');
+        }
+      }
+    }
+
+    let usingCachedSearchResults = false;
+    let finalNzbResults = [];
+    let triageDecisions = cachedSearchMeta
+      ? restoreTriageDecisions(cachedSearchMeta.triageDecisionsSnapshot)
+      : new Map();
+    if (cachedSearchMeta) {
+      finalNzbResults = restoreFinalNzbResults(cachedSearchMeta.finalNzbResults);
+      usingCachedSearchResults = true;
+    }
+    let triageTitleMap = buildTriageTitleMap(triageDecisions);
 
     const pickFirstDefined = (...values) => values.find((value) => value !== undefined && value !== null && String(value).trim() !== '') || null;
     const meta = req.query || {};
@@ -2030,201 +2464,204 @@ async function streamHandler(req, res) {
     const seasonToken = Number.isFinite(seasonNum) ? `{Season:${seasonNum}}` : null;
     const episodeToken = Number.isFinite(episodeNum) ? `{Episode:${episodeNum}}` : null;
 
-    const searchPlans = [];
-    const seenPlans = new Set();
-    const addPlan = (planType, { tokens = [], rawQuery = null } = {}) => {
-      const tokenList = [...tokens];
-      if (planType === 'tvsearch') {
-        if (seasonToken) tokenList.push(seasonToken);
-        if (episodeToken) tokenList.push(episodeToken);
+    if (!usingCachedSearchResults) {
+      const searchPlans = [];
+      const seenPlans = new Set();
+      const addPlan = (planType, { tokens = [], rawQuery = null } = {}) => {
+        const tokenList = [...tokens];
+        if (planType === 'tvsearch') {
+          if (seasonToken) tokenList.push(seasonToken);
+          if (episodeToken) tokenList.push(episodeToken);
+        }
+        const normalizedTokens = tokenList.filter(Boolean);
+        const query = rawQuery ? rawQuery : normalizedTokens.join(' ');
+        if (!query) {
+          return false;
+        }
+        const planKey = `${planType}|${query}`;
+        if (seenPlans.has(planKey)) {
+          return false;
+        }
+        seenPlans.add(planKey);
+        searchPlans.push({ type: planType, query, rawQuery: rawQuery ? rawQuery : null, tokens: normalizedTokens });
+        return true;
+      };
+
+      if (metaIds.imdb) {
+        addPlan(searchType, { tokens: [`{ImdbId:${metaIds.imdb}}`] });
       }
-      const normalizedTokens = tokenList.filter(Boolean);
-      const query = rawQuery ? rawQuery : normalizedTokens.join(' ');
-      if (!query) {
-        return false;
+
+      if (type === 'series' && metaIds.tvdb) {
+        addPlan('tvsearch', { tokens: [`{TvdbId:${metaIds.tvdb}}`] });
       }
-      const planKey = `${planType}|${query}`;
-      if (seenPlans.has(planKey)) {
-        return false;
+
+      if (type === 'movie' && metaIds.tmdb) {
+        addPlan('movie', { tokens: [`{TmdbId:${metaIds.tmdb}}`] });
       }
-      seenPlans.add(planKey);
-      searchPlans.push({ type: planType, query, rawQuery: rawQuery ? rawQuery : null, tokens: normalizedTokens });
-      return true;
-    };
 
-    if (metaIds.imdb) {
-      addPlan(searchType, { tokens: [`{ImdbId:${metaIds.imdb}}`] });
-    }
+      if (searchPlans.length === 0 && metaIds.imdb) {
+        addPlan(searchType, { tokens: [`{ImdbId:${metaIds.imdb}}`] });
+      }
 
-    if (type === 'series' && metaIds.tvdb) {
-      addPlan('tvsearch', { tokens: [`{TvdbId:${metaIds.tvdb}}`] });
-    }
+      const textQueryParts = [];
+      if (movieTitle) {
+        textQueryParts.push(movieTitle);
+      }
+      if (type === 'movie' && Number.isFinite(releaseYear)) {
+        textQueryParts.push(String(releaseYear));
+      } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
+        textQueryParts.push(`S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`);
+      }
 
-    if (type === 'movie' && metaIds.tmdb) {
-      addPlan('movie', { tokens: [`{TmdbId:${metaIds.tmdb}}`] });
-    }
+    const shouldForceTextSearch = isSpecialRequest;
+      const shouldAddTextSearch = shouldForceTextSearch || (!INDEXER_MANAGER_STRICT_ID_MATCH && !incomingTvdbId);
 
-    if (searchPlans.length === 0 && metaIds.imdb) {
-      addPlan(searchType, { tokens: [`{ImdbId:${metaIds.imdb}}`] });
-    }
-
-    const textQueryParts = [];
-    if (movieTitle) {
-      textQueryParts.push(movieTitle);
-    }
-    if (type === 'movie' && Number.isFinite(releaseYear)) {
-      textQueryParts.push(String(releaseYear));
-    } else if (type === 'series' && Number.isFinite(seasonNum) && Number.isFinite(episodeNum)) {
-      textQueryParts.push(`S${String(seasonNum).padStart(2, '0')}E${String(episodeNum).padStart(2, '0')}`);
-    }
-
-  const shouldForceTextSearch = isSpecialRequest;
-    const shouldAddTextSearch = shouldForceTextSearch || (!INDEXER_MANAGER_STRICT_ID_MATCH && !incomingTvdbId);
-
-    if (shouldAddTextSearch) {
-      const fallbackIdentifier = incomingImdbId || baseIdentifier;
-      const textQueryCandidate = textQueryParts.join(' ').trim();
-      const textQueryFallback = (textQueryCandidate || fallbackIdentifier).trim();
-      if (textQueryFallback) {
-        const addedTextPlan = addPlan('search', { rawQuery: textQueryFallback });
-        if (addedTextPlan) {
-          console.log(`${INDEXER_LOG_PREFIX} Added text search plan`, { query: textQueryFallback });
+      if (shouldAddTextSearch) {
+        const fallbackIdentifier = incomingImdbId || baseIdentifier;
+        const textQueryCandidate = textQueryParts.join(' ').trim();
+        const textQueryFallback = (textQueryCandidate || fallbackIdentifier).trim();
+        if (textQueryFallback) {
+          const addedTextPlan = addPlan('search', { rawQuery: textQueryFallback });
+          if (addedTextPlan) {
+            console.log(`${INDEXER_LOG_PREFIX} Added text search plan`, { query: textQueryFallback });
+          } else {
+            console.log(`${INDEXER_LOG_PREFIX} Text search plan already present`, { query: textQueryFallback });
+          }
         } else {
-          console.log(`${INDEXER_LOG_PREFIX} Text search plan already present`, { query: textQueryFallback });
+          console.log(`${INDEXER_LOG_PREFIX} Skipping text search plan; insufficient metadata`);
         }
       } else {
-        console.log(`${INDEXER_LOG_PREFIX} Skipping text search plan; insufficient metadata`);
+        const reason = INDEXER_MANAGER_STRICT_ID_MATCH ? 'strict ID matching enabled' : 'tvdb identifier provided';
+        console.log(`${INDEXER_LOG_PREFIX} ${reason}; skipping text-based search`);
       }
-    } else {
-      const reason = INDEXER_MANAGER_STRICT_ID_MATCH ? 'strict ID matching enabled' : 'tvdb identifier provided';
-      console.log(`${INDEXER_LOG_PREFIX} ${reason}; skipping text-based search`);
-    }
 
-    if (INDEXER_MANAGER_INDEXERS) {
-      console.log(`${INDEXER_LOG_PREFIX} Using configured indexers`, INDEXER_MANAGER_INDEXERS);
-    } else {
-      console.log(`${INDEXER_LOG_PREFIX} Using manager default indexer selection`);
-    }
+      if (INDEXER_MANAGER_INDEXERS) {
+        console.log(`${INDEXER_LOG_PREFIX} Using configured indexers`, INDEXER_MANAGER_INDEXERS);
+      } else {
+        console.log(`${INDEXER_LOG_PREFIX} Using manager default indexer selection`);
+      }
 
-    const deriveResultKey = (result) => {
-      if (!result) return null;
-      const indexerId = result.indexerId || result.IndexerId || 'unknown';
-      const indexer = result.indexer || result.Indexer || '';
-      const title = (result.title || result.Title || '').trim();
-      const size = result.size || result.Size || 0;
-      
-      // Use title + indexer info + size as unique key for better deduplication
-      return `${indexerId}|${indexer}|${title}|${size}`;
-    };
+      const deriveResultKey = (result) => {
+        if (!result) return null;
+        const indexerId = result.indexerId || result.IndexerId || 'unknown';
+        const indexer = result.indexer || result.Indexer || '';
+        const title = (result.title || result.Title || '').trim();
+        const size = result.size || result.Size || 0;
+        
+        // Use title + indexer info + size as unique key for better deduplication
+        return `${indexerId}|${indexer}|${title}|${size}`;
+      };
 
-    const usingStrictIdMatching = INDEXER_MANAGER_STRICT_ID_MATCH;
-    const resultsByKey = usingStrictIdMatching ? null : new Map();
-    const aggregatedResults = usingStrictIdMatching ? [] : null;
-    const planSummaries = [];
+      const usingStrictIdMatching = INDEXER_MANAGER_STRICT_ID_MATCH;
+      const resultsByKey = usingStrictIdMatching ? null : new Map();
+      const aggregatedResults = usingStrictIdMatching ? [] : null;
+      const planSummaries = [];
 
-    const planExecutions = searchPlans.map((plan) => {
-      console.log(`${INDEXER_LOG_PREFIX} Dispatching plan`, plan);
-      return executeIndexerPlan(plan)
-        .then((data) => ({ plan, status: 'fulfilled', data }))
-        .catch((error) => ({ plan, status: 'rejected', error }));
-    });
+      const planExecutions = searchPlans.map((plan) => {
+        console.log(`${INDEXER_LOG_PREFIX} Dispatching plan`, plan);
+        return executeIndexerPlan(plan)
+          .then((data) => ({ plan, status: 'fulfilled', data }))
+          .catch((error) => ({ plan, status: 'rejected', error }));
+      });
 
-    const planResultsSettled = await Promise.all(planExecutions);
+      const planResultsSettled = await Promise.all(planExecutions);
 
-    for (const result of planResultsSettled) {
-      const { plan } = result;
-      if (result.status === 'rejected') {
-        console.error(`${INDEXER_LOG_PREFIX} ❌ Search plan failed`, {
-          message: result.error.message,
-          type: plan.type,
-          query: plan.query
+      for (const result of planResultsSettled) {
+        const { plan } = result;
+        if (result.status === 'rejected') {
+          console.error(`${INDEXER_LOG_PREFIX} ❌ Search plan failed`, {
+            message: result.error.message,
+            type: plan.type,
+            query: plan.query
+          });
+          planSummaries.push({
+            planType: plan.type,
+            query: plan.query,
+            total: 0,
+            filtered: 0,
+            uniqueAdded: 0,
+            error: result.error.message
+          });
+          continue;
+        }
+
+        const planResults = Array.isArray(result.data) ? result.data : [];
+  console.log(`${INDEXER_LOG_PREFIX} ✅ ${plan.type} returned ${planResults.length} total results for query "${plan.query}"`);
+
+        const filteredResults = planResults.filter((item) => {
+          if (!item || typeof item !== 'object') {
+            return false;
+          }
+          if (!item.downloadUrl) {
+            return false;
+          }
+          return true;
         });
+
+        let addedCount = 0;
+        if (usingStrictIdMatching) {
+          aggregatedResults.push(...filteredResults.map((item) => ({ result: item, planType: plan.type })));
+          addedCount = filteredResults.length;
+        } else {
+          const beforeSize = resultsByKey.size;
+          for (const item of filteredResults) {
+            const key = deriveResultKey(item);
+            if (!key) continue;
+            if (!resultsByKey.has(key)) {
+              resultsByKey.set(key, { result: item, planType: plan.type });
+            }
+          }
+          addedCount = resultsByKey.size - beforeSize;
+        }
+
         planSummaries.push({
           planType: plan.type,
           query: plan.query,
-          total: 0,
-          filtered: 0,
-          uniqueAdded: 0,
-          error: result.error.message
+          total: planResults.length,
+          filtered: filteredResults.length,
+          uniqueAdded: addedCount
         });
-        continue;
+        console.log(`${INDEXER_LOG_PREFIX} ✅ Plan summary`, planSummaries[planSummaries.length - 1]);
       }
 
-      const planResults = Array.isArray(result.data) ? result.data : [];
-  console.log(`${INDEXER_LOG_PREFIX} ✅ ${plan.type} returned ${planResults.length} total results for query "${plan.query}"`);
-
-      const filteredResults = planResults.filter((item) => {
-        if (!item || typeof item !== 'object') {
-          return false;
-        }
-        if (!item.downloadUrl) {
-          return false;
-        }
-        return true;
-      });
-
-      let addedCount = 0;
-      if (usingStrictIdMatching) {
-        aggregatedResults.push(...filteredResults.map((item) => ({ result: item, planType: plan.type })));
-        addedCount = filteredResults.length;
+      const aggregationCount = usingStrictIdMatching ? aggregatedResults.length : resultsByKey.size;
+      if (aggregationCount === 0) {
+        console.warn(`${INDEXER_LOG_PREFIX} ⚠ All ${searchPlans.length} search plans returned no NZB results`);
+      } else if (usingStrictIdMatching) {
+        console.log(`${INDEXER_LOG_PREFIX} ✅ Aggregated NZB results with strict ID matching`, {
+          plansRun: searchPlans.length,
+          totalResults: aggregationCount
+        });
       } else {
-        const beforeSize = resultsByKey.size;
-        for (const item of filteredResults) {
-          const key = deriveResultKey(item);
-          if (!key) continue;
-          if (!resultsByKey.has(key)) {
-            resultsByKey.set(key, { result: item, planType: plan.type });
-          }
-        }
-        addedCount = resultsByKey.size - beforeSize;
+        console.log(`${INDEXER_LOG_PREFIX} ✅ Aggregated unique NZB results`, {
+          plansRun: searchPlans.length,
+          uniqueResults: aggregationCount
+        });
       }
 
-      planSummaries.push({
-        planType: plan.type,
-        query: plan.query,
-        total: planResults.length,
-        filtered: filteredResults.length,
-        uniqueAdded: addedCount
-      });
-      console.log(`${INDEXER_LOG_PREFIX} ✅ Plan summary`, planSummaries[planSummaries.length - 1]);
-    }
+      const dedupedNzbResults = usingStrictIdMatching
+        ? aggregatedResults.map((entry) => entry.result)
+        : Array.from(resultsByKey.values()).map((entry) => entry.result);
 
-    const aggregationCount = usingStrictIdMatching ? aggregatedResults.length : resultsByKey.size;
-    if (aggregationCount === 0) {
-      console.warn(`${INDEXER_LOG_PREFIX} ⚠ All ${searchPlans.length} search plans returned no NZB results`);
-    } else if (usingStrictIdMatching) {
-      console.log(`${INDEXER_LOG_PREFIX} ✅ Aggregated NZB results with strict ID matching`, {
-        plansRun: searchPlans.length,
-        totalResults: aggregationCount
-      });
-    } else {
-      console.log(`${INDEXER_LOG_PREFIX} ✅ Aggregated unique NZB results`, {
-        plansRun: searchPlans.length,
-        uniqueResults: aggregationCount
-      });
-    }
-
-    const dedupedNzbResults = usingStrictIdMatching
-      ? aggregatedResults.map((entry) => entry.result)
-      : Array.from(resultsByKey.values()).map((entry) => entry.result);
-
-    const finalNzbResults = dedupedNzbResults
-      .filter((result, index) => {
-        if (!result.downloadUrl || !result.indexerId) {
-          console.warn(`${INDEXER_LOG_PREFIX} Skipping NZB result ${index} missing required fields`, {
-            hasDownloadUrl: !!result.downloadUrl,
-            hasIndexerId: !!result.indexerId,
-            title: result.title
-          });
-          return false;
-        }
-        return true;
-      })
-      .map((result) => ({ ...result, _sourceType: 'nzb' }));
+      finalNzbResults = dedupedNzbResults
+        .filter((result, index) => {
+          if (!result.downloadUrl || !result.indexerId) {
+            console.warn(`${INDEXER_LOG_PREFIX} Skipping NZB result ${index} missing required fields`, {
+              hasDownloadUrl: !!result.downloadUrl,
+              hasIndexerId: !!result.indexerId,
+              title: result.title
+            });
+            return false;
+          }
+          return true;
+        })
+        .map((result) => ({ ...result, _sourceType: 'nzb' }));
 
   console.log(`${INDEXER_LOG_PREFIX} Final NZB selection: ${finalNzbResults.length} results`);
+    }
 
     const triageOverrides = extractTriageOverrides(req.query || {});
+    const allowedCacheStatuses = new Set(['verified', 'blocked']);
     const requestedDisable = triageOverrides.disabled === true;
     const requestedEnable = triageOverrides.enabled === true;
     const overrideIndexerTokens = (triageOverrides.indexers && triageOverrides.indexers.length > 0)
@@ -2237,19 +2674,38 @@ async function streamHandler(req, res) {
       ? TRIAGE_SERIALIZED_INDEXERS
       : healthIndexerTokens;
     const healthIndexerSet = new Set((healthIndexerTokens || []).map((token) => normalizeIndexerToken(token)).filter(Boolean));
-    const triageEligibleResults = healthIndexerSet.size > 0
+    const preferredSizeBytes = triageOverrides.sizeBytes ?? TRIAGE_PREFERRED_SIZE_BYTES;
+    const triagePool = healthIndexerSet.size > 0
       ? finalNzbResults.filter((result) => nzbMatchesIndexer(result, healthIndexerSet))
       : [];
-    const shouldAttemptTriage = triageEligibleResults.length > 0 && !requestedDisable && (requestedEnable || TRIAGE_ENABLED);
+    const triageEligibleResults = prioritizeTriageCandidates(
+      triagePool,
+      preferredSizeBytes,
+      TRIAGE_MAX_CANDIDATES
+    );
+    const candidateHasConclusiveDecision = (candidate) => {
+      const decision = triageDecisions.get(candidate.downloadUrl);
+      if (decision && allowedCacheStatuses.has(decision.status)) {
+        return true;
+      }
+      const normalizedTitle = normalizeReleaseTitle(candidate.title);
+      if (normalizedTitle) {
+        const derived = triageTitleMap.get(normalizedTitle);
+        if (derived && allowedCacheStatuses.has(derived.status)) {
+          return true;
+        }
+      }
+      return false;
+    };
+    const triageCandidatesToRun = triageEligibleResults.filter((candidate) => !candidateHasConclusiveDecision(candidate));
+    const shouldAttemptTriage = triageCandidatesToRun.length > 0 && !requestedDisable && (requestedEnable || TRIAGE_ENABLED);
     let triageOutcome = null;
-    let triageDecisions = new Map();
-  let triageTitleMap = new Map();
+    let triageCompleteForCache = !shouldAttemptTriage;
 
     if (shouldAttemptTriage) {
       if (!TRIAGE_NNTP_CONFIG) {
         console.warn('[NZB TRIAGE] Skipping health checks because NNTP configuration is missing');
       } else {
-        const preferredSizeBytes = triageOverrides.sizeBytes ?? TRIAGE_PREFERRED_SIZE_BYTES;
         const triageLogger = (level, message, context) => {
           const logFn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
           if (context) logFn(`[NZB TRIAGE] ${message}`, context);
@@ -2267,11 +2723,15 @@ async function streamHandler(req, res) {
             ...TRIAGE_BASE_OPTIONS,
             nntpConfig: { ...TRIAGE_NNTP_CONFIG },
           },
+          captureNzbPayloads: true,
           logger: triageLogger,
         };
         try {
-          triageOutcome = await triageAndRank(triageEligibleResults, triageOptions);
-          triageDecisions = triageOutcome?.decisions instanceof Map ? triageOutcome.decisions : new Map(triageOutcome?.decisions || []);
+          triageOutcome = await triageAndRank(triageCandidatesToRun, triageOptions);
+          const latestDecisions = triageOutcome?.decisions instanceof Map ? triageOutcome.decisions : new Map(triageOutcome?.decisions || []);
+          latestDecisions.forEach((decision, downloadUrl) => {
+            triageDecisions.set(downloadUrl, decision);
+          });
           triageTitleMap = buildTriageTitleMap(triageDecisions);
           console.log(`[NZB TRIAGE] Evaluated ${triageOutcome.evaluatedCount}/${triageOutcome.candidatesConsidered} candidate NZBs in ${triageOutcome.elapsedMs} ms (timedOut=${triageOutcome.timedOut})`);
           if (triageDecisions.size > 0) {
@@ -2306,7 +2766,57 @@ async function streamHandler(req, res) {
       }
     }
 
+    if (shouldAttemptTriage) {
+      triageCompleteForCache = Boolean(
+        triageOutcome
+        && !triageOutcome?.timedOut
+        && triageDecisionsMatchStatuses(triageDecisions, triageEligibleResults, allowedCacheStatuses)
+      );
+    }
+
+    if (triageCompleteForCache && shouldAttemptTriage) {
+      triageEligibleResults.forEach((candidate) => {
+        const decision = triageDecisions.get(candidate.downloadUrl);
+        if (decision && decision.status === 'verified' && typeof decision.nzbPayload === 'string') {
+          cacheVerifiedNzbPayload(candidate.downloadUrl, decision.nzbPayload, {
+            title: decision.title || candidate.title,
+            size: candidate.size,
+            fileName: candidate.title,
+          });
+        }
+        if (decision && decision.nzbPayload) {
+          delete decision.nzbPayload;
+        }
+      });
+    } else if (triageDecisions && triageDecisions.size > 0) {
+      triageDecisions.forEach((decision) => {
+        if (decision && decision.nzbPayload) {
+          delete decision.nzbPayload;
+        }
+      });
+    }
+
     cleanupNzbdavCache();
+
+    const triagePendingDownloadUrls = triageEligibleResults
+      .filter((candidate) => !candidateHasConclusiveDecision(candidate))
+      .map((candidate) => candidate.downloadUrl);
+    const cacheReadyDecisionEntries = Array.from(triageDecisions.entries())
+      .map(([downloadUrl, decision]) => {
+        const sanitized = sanitizeDecisionForCache(decision);
+        return sanitized ? [downloadUrl, sanitized] : null;
+      })
+      .filter(Boolean);
+    const cacheMeta = streamCacheKey
+      ? {
+          version: 1,
+          storedAt: Date.now(),
+          triageComplete: !triageOutcome?.timedOut && triagePendingDownloadUrls.length === 0,
+          triagePendingDownloadUrls,
+          finalNzbResults: serializeFinalNzbResults(finalNzbResults),
+          triageDecisionsSnapshot: cacheReadyDecisionEntries,
+        }
+      : null;
 
     const categoryForType = getNzbdavCategory(type);
     let historyByTitle = new Map();
@@ -2425,7 +2935,6 @@ async function streamHandler(req, res) {
         const tags = [];
         if (triageTag) tags.push(triageTag);
         if (isInstant) tags.push('⚡ Instant');
-        tags.push('📰 NZB');
         if (quality) tags.push(quality);
         if (sizeString) tags.push(sizeString);
         const name = 'UsenetStreamer';
@@ -2526,7 +3035,12 @@ async function streamHandler(req, res) {
 
     console.log(`[STREMIO] Returning ${streams.length} NZB streams`);
 
-    res.json({ streams });
+    const responsePayload = { streams };
+    if (streamCacheKey && cacheMeta) {
+      setStreamCacheEntry(streamCacheKey, responsePayload, cacheMeta);
+    }
+
+    res.json(responsePayload);
   } catch (error) {
     console.error('[ERROR] Processing failed:', error.message);
     res.status(error.response?.status || 500).json({

@@ -49,7 +49,7 @@
             </label>
             <label>Paid Indexers (comma separated)
               <input name="NZB_TRIAGE_PRIORITY_INDEXERS" type="text" placeholder="9,33" />
-              <span class="field-hint">Subset of the above list that gets triaged first. Must be a comma-separated subset of “Indexer IDs / Names”.</span>
+              <span class="field-hint">Subset of the above list that gets used for health checks. Must be a comma-separated subset of “Indexer IDs / Names”.</span>
             </label>
             <label class="checkbox">
               <input name="INDEXER_MANAGER_STRICT_ID_MATCH" type="checkbox" />
@@ -105,26 +105,26 @@
               <span>Enable NZB Health Checks</span>
             </label>
             <label>Usenet Provider Host
-              <input name="NZB_TRIAGE_NNTP_HOST" type="text" placeholder="news.easynews.com" />
+              <input name="NZB_TRIAGE_NNTP_HOST" type="text" placeholder="news.easynews.com" data-health-required="true" />
             </label>
             <label>Usenet Provider Port
-              <input name="NZB_TRIAGE_NNTP_PORT" type="number" min="1" placeholder="563" />
+              <input name="NZB_TRIAGE_NNTP_PORT" type="number" min="1" placeholder="563" data-health-required="true" />
             </label>
             <label class="checkbox">
               <input name="NZB_TRIAGE_NNTP_TLS" type="checkbox" />
               <span>Use TLS</span>
             </label>
             <label>Usenet Provider Username
-              <input name="NZB_TRIAGE_NNTP_USER" type="text" autocomplete="off" />
+              <input name="NZB_TRIAGE_NNTP_USER" type="text" autocomplete="off" data-health-required="true" />
             </label>
             <label>Usenet Provider Password
-              <input name="NZB_TRIAGE_NNTP_PASS" type="password" autocomplete="new-password" />
+              <input name="NZB_TRIAGE_NNTP_PASS" type="password" autocomplete="new-password" data-health-required="true" />
             </label>
             <label>Preferred Size (GB)
-              <input name="NZB_TRIAGE_PREFERRED_SIZE_GB" type="number" min="0" step="0.1" placeholder="20" />
+              <input name="NZB_TRIAGE_PREFERRED_SIZE_GB" type="number" min="0" step="0.1" placeholder="20" data-health-required="true" />
             </label>
             <label>Number of NZBs to Inspect
-              <select name="NZB_TRIAGE_MAX_CANDIDATES">
+              <select name="NZB_TRIAGE_MAX_CANDIDATES" data-health-required="true">
                 <option value="2">2</option>
                 <option value="4">4</option>
                 <option value="6">6</option>
@@ -132,7 +132,8 @@
               <span class="field-hint">Pick 2 for the fastest responses, 4 or 6 to probe more candidates.</span>
             </label>
             <label>Max Usenet Connections
-              <input name="NZB_TRIAGE_MAX_CONNECTIONS" type="number" min="1" step="1" />
+              <input name="NZB_TRIAGE_MAX_CONNECTIONS" type="number" min="1" step="1" data-health-required="true" />
+              <span class="field-hint">Should not exceed twice the number set in “Number of NZBs to Inspect”.</span>
             </label>
           </div>
           <div class="inline-actions">

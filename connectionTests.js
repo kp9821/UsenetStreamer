@@ -20,6 +20,13 @@ function parseBoolean(value) {
   return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on';
 }
 
+function formatVersionLabel(prefix, version) {
+  if (!version) return prefix;
+  const normalized = String(version).trim();
+  if (!normalized) return prefix;
+  return `${prefix} (v${normalized.replace(/^v/i, '')})`;
+}
+
 async function testIndexerConnection(values) {
   const managerType = String(values?.INDEXER_MANAGER || 'prowlarr').trim().toLowerCase() || 'prowlarr';
   const baseUrl = sanitizeBaseUrl(values?.INDEXER_MANAGER_URL);
@@ -35,8 +42,8 @@ async function testIndexerConnection(values) {
       validateStatus: () => true,
     });
     if (response.status === 200) {
-      const version = response.data?.version || response.data?.appVersion || 'unknown';
-      return `Connected to Prowlarr (${version})`;
+      const version = response.data?.version || response.data?.appVersion || null;
+      return formatVersionLabel('Connected to Prowlarr', version);
     }
     if (response.status === 401 || response.status === 403) {
       throw new Error('Unauthorized: check Prowlarr API key');
@@ -65,7 +72,7 @@ async function testIndexerConnection(values) {
     } else if (response.data?.['@attributes']?.version) {
       version = response.data['@attributes'].version;
     }
-    return `Connected to NZBHydra${version ? ` (${version})` : ''}`;
+    return formatVersionLabel('Connected to NZBHydra', version);
   }
   if (response.status === 401 || response.status === 403) {
     throw new Error('Unauthorized: check NZBHydra API key');
@@ -131,7 +138,7 @@ async function testNzbdavConnection(values) {
       }
 
       const version = payload?.queue?.version || payload?.version || payload?.server_version || payload?.appVersion;
-      return `Connected to NZBDav/SAB API${version ? ` (${version})` : ''}`;
+      return formatVersionLabel('Connected to NZBDav/SAB API', version);
     } catch (error) {
       lastIssue = error;
     }
