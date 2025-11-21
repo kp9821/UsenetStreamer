@@ -52,10 +52,10 @@
               <input name="NZB_TRIAGE_PRIORITY_INDEXERS" type="text" placeholder="9,33" />
               <span class="field-hint">Subset of the above list that gets used for health checks. Must be a comma-separated subset of “Indexer IDs / Names”.</span>
             </label>
-            <label class="checkbox" data-manager-field>
+            <label class="checkbox">
               <input name="INDEXER_MANAGER_STRICT_ID_MATCH" type="checkbox" />
               <span>Strict ID Matching Only</span>
-              <span class="field-hint">Faster ID-only searches; indexers that rely on text queries will be skipped.</span>
+              <span class="field-hint">Applies to both manager and direct Newznab searches. ID-only mode skips text queries.</span>
             </label>
           </div>
           <div class="inline-actions" data-manager-field>

@@ -504,4 +504,51 @@ button.ghost.danger:hover {
     width: 100%;
     text-align: center;
   }
+
+  .newznab-preset-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .newznab-preset-bar select,
+  .newznab-preset-bar button,
+  .newznab-preset-bar .secondary {
+    width: 100%;
+  }
+
+  .newznab-row {
+    padding: 0.85rem;
+  }
+
+  .newznab-row .row-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .row-controls {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .newznab-row .field-grid {
+    grid-template-columns: 1fr;
+  }
+
+  #newznab-test-search .field-grid {
+    grid-template-columns: 1fr;
+  }
+
+  #newznab-test-search .actions {
+    align-items: stretch;
+  }
+
+  #newznab-test-search .actions .secondary,
+  .newznab-controls .secondary,
+  .newznab-controls button {
+    width: 100%;
+  }
+
+  .newznab-controls {
+    align-items: stretch;
+  }
 }

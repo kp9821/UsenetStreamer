@@ -219,6 +219,7 @@ let NEWZNAB_ENABLED = toBoolean(process.env.NEWZNAB_ENABLED, false);
 let NEWZNAB_FILTER_NZB_ONLY = toBoolean(process.env.NEWZNAB_FILTER_NZB_ONLY, true);
 let DEBUG_NEWZNAB_SEARCH = toBoolean(process.env.DEBUG_NEWZNAB_SEARCH, false);
 let DEBUG_NEWZNAB_TEST = toBoolean(process.env.DEBUG_NEWZNAB_TEST, false);
+let DEBUG_NEWZNAB_ENDPOINTS = toBoolean(process.env.DEBUG_NEWZNAB_ENDPOINTS, false);
 let NEWZNAB_CONFIGS = newznabService.getEnvNewznabConfigs({ includeEmpty: false });
 let ACTIVE_NEWZNAB_CONFIGS = newznabService.filterUsableConfigs(NEWZNAB_CONFIGS, { requireEnabled: true, requireApiKey: true });
 const NEWZNAB_LOG_PREFIX = '[NEWZNAB]';
@@ -241,7 +242,11 @@ function buildSearchLogPrefix({ manager = INDEXER_MANAGER, managerLabel = INDEXE
 INDEXER_LOG_PREFIX = buildSearchLogPrefix();
 
 function isNewznabDebugEnabled() {
-  return Boolean(DEBUG_NEWZNAB_SEARCH || DEBUG_NEWZNAB_TEST);
+  return Boolean(DEBUG_NEWZNAB_SEARCH || DEBUG_NEWZNAB_TEST || DEBUG_NEWZNAB_ENDPOINTS);
+}
+
+function isNewznabEndpointLoggingEnabled() {
+  return Boolean(DEBUG_NEWZNAB_ENDPOINTS);
 }
 
 function summarizeNewznabPlan(plan) {
@@ -388,6 +393,7 @@ function rebuildRuntimeConfig({ log = true } = {}) {
   NEWZNAB_FILTER_NZB_ONLY = toBoolean(process.env.NEWZNAB_FILTER_NZB_ONLY, true);
   DEBUG_NEWZNAB_SEARCH = toBoolean(process.env.DEBUG_NEWZNAB_SEARCH, false);
   DEBUG_NEWZNAB_TEST = toBoolean(process.env.DEBUG_NEWZNAB_TEST, false);
+  DEBUG_NEWZNAB_ENDPOINTS = toBoolean(process.env.DEBUG_NEWZNAB_ENDPOINTS, false);
   NEWZNAB_CONFIGS = newznabService.getEnvNewznabConfigs({ includeEmpty: false });
   ACTIVE_NEWZNAB_CONFIGS = newznabService.filterUsableConfigs(NEWZNAB_CONFIGS, { requireEnabled: true, requireApiKey: true });
   INDEXER_LOG_PREFIX = buildSearchLogPrefix({
@@ -550,6 +556,7 @@ function executeManagerPlanWithBackoff(plan) {
 
 function executeNewznabPlan(plan) {
   const debugEnabled = isNewznabDebugEnabled();
+  const endpointLogEnabled = isNewznabEndpointLoggingEnabled();
   const planSummary = summarizeNewznabPlan(plan);
   if (!NEWZNAB_ENABLED || ACTIVE_NEWZNAB_CONFIGS.length === 0) {
     logNewznabDebug('Skipping search plan because direct Newznab is disabled or no configs are available', {
@@ -575,6 +582,7 @@ function executeNewznabPlan(plan) {
   return newznabService.searchNewznabIndexers(plan, ACTIVE_NEWZNAB_CONFIGS, {
     filterNzbOnly: NEWZNAB_FILTER_NZB_ONLY,
     debug: debugEnabled,
+    logEndpoints: endpointLogEnabled,
     label: NEWZNAB_LOG_PREFIX,
   }).then((result) => {
     logNewznabDebug('Search plan completed', {
@@ -866,13 +874,13 @@ async function streamHandler(req, res) {
     if (incomingTvdbId) {
       metaSources.push({ ids: { tvdb: incomingTvdbId }, tvdb_id: incomingTvdbId });
     }
-    let specialMetadata = null;
+    let specialMetadataResult = null;
     if (isSpecialRequest) {
       try {
-        specialMetadata = await specialMetadata.fetchSpecialMetadata(baseIdentifier);
-        if (specialMetadata?.title) {
-          metaSources.push({ title: specialMetadata.title, name: specialMetadata.title });
-          console.log('[SPECIAL META] Resolved title for external catalog request', { title: specialMetadata.title });
+        specialMetadataResult = await specialMetadata.fetchSpecialMetadata(baseIdentifier);
+        if (specialMetadataResult?.title) {
+          metaSources.push({ title: specialMetadataResult.title, name: specialMetadataResult.title });
+          console.log('[SPECIAL META] Resolved title for external catalog request', { title: specialMetadataResult.title });
         }
       } catch (error) {
         console.error('[SPECIAL META] Failed to resolve metadata:', error.message);
@@ -882,11 +890,13 @@ async function streamHandler(req, res) {
     }
     let cinemetaMeta = null;
 
-    const needsCinemeta = !INDEXER_MANAGER_STRICT_ID_MATCH && !incomingTvdbId && !isSpecialRequest && (
+    const needsStrictSeriesTvdb = !isSpecialRequest && type === 'series' && !incomingTvdbId && Boolean(incomingImdbId);
+    const needsRelaxedMetadata = !isSpecialRequest && !INDEXER_MANAGER_STRICT_ID_MATCH && (
       (!hasTitleInQuery) ||
       (type === 'series' && !hasTvdbInQuery) ||
       (type === 'movie' && !hasTmdbInQuery)
     );
+    const needsCinemeta = needsStrictSeriesTvdb || needsRelaxedMetadata;
     if (needsCinemeta) {
       const cinemetaPath = type === 'series' ? `series/${baseIdentifier}.json` : `${type}/${baseIdentifier}.json`;
       const cinemetaUrl = `${CINEMETA_URL}/${cinemetaPath}`;
@@ -1067,12 +1077,12 @@ async function streamHandler(req, res) {
         return true;
       };
 
-      if (metaIds.imdb) {
-        addPlan(searchType, { tokens: [`{ImdbId:${metaIds.imdb}}`] });
-      }
-
       if (type === 'series' && metaIds.tvdb) {
         addPlan('tvsearch', { tokens: [`{TvdbId:${metaIds.tvdb}}`] });
+      }
+
+      if (metaIds.imdb && !(type === 'series' && metaIds.tvdb)) {
+        addPlan(searchType, { tokens: [`{ImdbId:${metaIds.imdb}}`] });
       }
 
       if (type === 'movie' && metaIds.tmdb) {
@@ -1294,10 +1304,20 @@ async function streamHandler(req, res) {
     }
 
     const triageOverrides = extractTriageOverrides(req.query || {});
+    const effectiveMaxSizeBytes = (() => {
+      const overrideBytes = triageOverrides.maxSizeBytes;
+      const defaultBytes = INDEXER_MAX_RESULT_SIZE_BYTES;
+      const normalizedOverride = Number.isFinite(overrideBytes) && overrideBytes > 0 ? overrideBytes : null;
+      const normalizedDefault = Number.isFinite(defaultBytes) && defaultBytes > 0 ? defaultBytes : null;
+      if (normalizedOverride && normalizedDefault) {
+        return Math.min(normalizedOverride, normalizedDefault);
+      }
+      return normalizedOverride || normalizedDefault || null;
+    })();
     finalNzbResults = prepareSortedResults(finalNzbResults, {
       sortMode: triageOverrides.sortMode,
       preferredLanguage: triageOverrides.preferredLanguage,
-      maxSizeBytes: triageOverrides.maxSizeBytes,
+      maxSizeBytes: effectiveMaxSizeBytes,
       allowedResolutions: ALLOWED_RESOLUTIONS,
     });
     const allowedCacheStatuses = new Set(['verified', 'blocked']);

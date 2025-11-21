@@ -499,6 +499,16 @@ async function fetchIndexerResults(config, plan, options) {
   const requestUrl = config.baseUrl || `${config.endpoint}${config.apiPath}`;
   const safeParams = { ...params, apikey: maskApiKey(params.apikey) };
   const logPrefix = options.label || '[NEWZNAB]';
+  if (options.logEndpoints) {
+    const tokenSummary = Array.isArray(plan?.tokens) && plan.tokens.length > 0 ? plan.tokens.join(' ') : null;
+    console.log(`${logPrefix}[ENDPOINT]`, {
+      indexer: config.displayName || config.endpoint,
+      planType: plan?.type,
+      query: plan?.query,
+      tokens: tokenSummary,
+      url: requestUrl,
+    });
+  }
   if (options.debug) {
     console.log(`${logPrefix}[SEARCH][REQ]`, { url: requestUrl, params: safeParams });
   }
@@ -548,7 +558,8 @@ async function searchNewznabIndexers(plan, configs, options = {}) {
     filterNzbOnly: true,
     debug: false,
     timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
-  label: '[NEWZNAB]',
+    label: '[NEWZNAB]',
+    logEndpoints: false,
   };
   const settings = { ...defaults, ...options };
   const eligible = filterUsableConfigs(configs, { requireEnabled: true, requireApiKey: true });

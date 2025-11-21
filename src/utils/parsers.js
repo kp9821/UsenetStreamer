@@ -24,9 +24,9 @@ function normalizeReleaseTitle(title) {
 
 function parseRequestedEpisode(type, id, query = {}) {
   if (type !== 'series') return null;
-  
-  const videoId = String(id || '').split(':')[0];
-  const parts = videoId.split(':');
+
+  const rawId = String(id || '');
+  const parts = rawId.split(':');
   const season = parts[1] ? Number(parts[1]) : null;
   const episode = parts[2] ? Number(parts[2]) : null;
 
