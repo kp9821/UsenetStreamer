@@ -91,6 +91,8 @@ select {
   border-radius: 8px;
   padding: 0.55rem 0.75rem;
   color: inherit;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 input:focus,

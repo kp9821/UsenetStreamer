@@ -1029,12 +1029,12 @@ async function streamHandler(req, res) {
       )
     );
 
-    if (!movieTitle && specialMetadata?.title) {
-      movieTitle = specialMetadata.title;
+    if (!movieTitle && specialMetadataResult?.title) {
+      movieTitle = specialMetadataResult.title;
     }
 
-    if (!releaseYear && specialMetadata?.year) {
-      const specialYear = extractYear(specialMetadata.year);
+    if (!releaseYear && specialMetadataResult?.year) {
+      const specialYear = extractYear(specialMetadataResult.year);
       if (specialYear) {
         releaseYear = specialYear;
       }
@@ -1369,7 +1369,8 @@ async function streamHandler(req, res) {
       return false;
     };
     const triageCandidatesToRun = triageEligibleResults.filter((candidate) => !candidateHasConclusiveDecision(candidate));
-    const shouldAttemptTriage = triageCandidatesToRun.length > 0 && !requestedDisable && (requestedEnable || TRIAGE_ENABLED);
+    const shouldSkipTriageForRequest = !incomingImdbId && !incomingTvdbId;
+    const shouldAttemptTriage = triageCandidatesToRun.length > 0 && !requestedDisable && !shouldSkipTriageForRequest && (requestedEnable || TRIAGE_ENABLED);
     let triageOutcome = null;
     let triageCompleteForCache = !shouldAttemptTriage;
 
@@ -1434,6 +1435,8 @@ async function streamHandler(req, res) {
           console.warn(`[NZB TRIAGE] Health check failed: ${triageError.message}`);
         }
       }
+    } else if (shouldSkipTriageForRequest && TRIAGE_ENABLED && !requestedDisable) {
+      console.log('[NZB TRIAGE] Skipping health checks for non-ID request (no IMDb/TVDB identifier)');
     }
 
     if (shouldAttemptTriage) {
