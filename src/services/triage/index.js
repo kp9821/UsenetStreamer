@@ -5,14 +5,14 @@ const NNTPModule = require('nntp/lib/nntp');
 const NNTP = typeof NNTPModule === 'function' ? NNTPModule : NNTPModule?.NNTP;
 function timingLog(event, details) {
   const payload = details ? { ...details, ts: new Date().toISOString() } : { ts: new Date().toISOString() };
-  console.log(`[NZB TRIAGE][TIMING] ${event}`, payload);
+  // console.log(`[NZB TRIAGE][TIMING] ${event}`, payload);
 }
 
 const ARCHIVE_EXTENSIONS = new Set(['.rar', '.r00', '.r01', '.r02', '.7z']);
 const RAR4_SIGNATURE = Buffer.from([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00]);
 const RAR5_SIGNATURE = Buffer.from([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]);
 
-const TRIAGE_ACTIVITY_TTL_MS = 5 * 60 * 1000; // 1 hour window for keep-alives
+const TRIAGE_ACTIVITY_TTL_MS = 5 * 60 * 1000; // 5 mins window for keep-alives
 let lastTriageActivityTs = 0;
 
 const DEFAULT_OPTIONS = {
@@ -128,31 +128,49 @@ async function preWarmNntpPool(options = {}) {
   const keepAliveMs = Number.isFinite(config.nntpKeepAliveMs) ? config.nntpKeepAliveMs : 0;
   const poolKey = buildPoolKey(config.nntpConfig, desiredConnections, keepAliveMs);
 
-  if (sharedNntpPoolRecord?.key === poolKey && sharedNntpPoolRecord?.pool) {
-    if (typeof sharedNntpPoolRecord.pool.touch === 'function') {
-      sharedNntpPoolRecord.pool.touch();
-    }
+  // If there's already a build in progress, await it instead of starting a second one
+  const existingBuild = getInFlightPoolBuild();
+  if (existingBuild) {
+    await existingBuild;
     return;
   }
 
-  try {
-    const freshPool = await createNntpPool(config.nntpConfig, desiredConnections, { keepAliveMs });
-    if (sharedNntpPoolRecord?.pool) {
-      try {
-        await closePool(sharedNntpPoolRecord.pool, 'prewarm-replaced');
-      } catch (closeErr) {
-        console.warn('[NZB TRIAGE] Failed to close previous pre-warmed NNTP pool', closeErr?.message || closeErr);
+  // If pool exists and matches config, just touch it
+  if (sharedNntpPoolRecord?.key === poolKey && sharedNntpPoolRecord?.pool) {
+    if (isSharedPoolStale()) {
+      await closeSharedNntpPool('stale-prewarm');
+    } else {
+      if (typeof sharedNntpPoolRecord.pool.touch === 'function') {
+        sharedNntpPoolRecord.pool.touch();
       }
+      return;
     }
-    sharedNntpPoolRecord = { key: poolKey, pool: freshPool, keepAliveMs };
-    recordPoolCreate(freshPool, { reason: 'prewarm' });
-  } catch (err) {
-    console.warn('[NZB TRIAGE] Failed to pre-warm NNTP pool', {
-      message: err?.message,
-      code: err?.code,
-      name: err?.name,
-    });
   }
+
+  const buildPromise = (async () => {
+    try {
+      const freshPool = await createNntpPool(config.nntpConfig, desiredConnections, { keepAliveMs });
+      if (sharedNntpPoolRecord?.pool) {
+        try {
+          await closePool(sharedNntpPoolRecord.pool, 'prewarm-replaced');
+        } catch (closeErr) {
+          console.warn('[NZB TRIAGE] Failed to close previous pre-warmed NNTP pool', closeErr?.message || closeErr);
+        }
+      }
+      sharedNntpPoolRecord = { key: poolKey, pool: freshPool, keepAliveMs };
+      recordPoolCreate(freshPool, { reason: 'prewarm' });
+    } catch (err) {
+      console.warn('[NZB TRIAGE] Failed to pre-warm NNTP pool', {
+        message: err?.message,
+        code: err?.code,
+        name: err?.name,
+      });
+    }
+  })();
+
+  setInFlightPoolBuild(buildPromise);
+  await buildPromise;
+  clearInFlightPoolBuild(buildPromise);
 }
 
 async function triageNzbs(nzbStrings, options = {}) {
@@ -1414,6 +1432,13 @@ async function closeSharedNntpPool(reason = 'manual') {
   }
 }
 
+async function evictStaleSharedNntpPool(reason = 'stale-timeout') {
+  if (!sharedNntpPoolRecord?.pool) return false;
+  if (!isSharedPoolStale()) return false;
+  await closeSharedNntpPool(reason);
+  return true;
+}
+
 function runWithDeadline(factory, timeoutMs) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return factory();
   let timer = null;
@@ -1439,4 +1464,5 @@ module.exports = {
   preWarmNntpPool,
   triageNzbs,
   closeSharedNntpPool,
+  evictStaleSharedNntpPool,
 };

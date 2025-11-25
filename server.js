@@ -22,7 +22,7 @@ const {
   testNewznabSearch,
 } = require('./src/utils/connectionTests');
 const { triageAndRank } = require('./src/services/triage/runner');
-const { preWarmNntpPool } = require('./src/services/triage');
+const { preWarmNntpPool, evictStaleSharedNntpPool } = require('./src/services/triage');
 const {
   getPublishMetadataFromResult,
   areReleasesWithinDays,
@@ -41,7 +41,7 @@ const specialMetadata = require('./src/services/specialMetadata');
 
 const app = express();
 let currentPort = Number(process.env.PORT || 7000);
-const ADDON_VERSION = '1.4.3';
+const ADDON_VERSION = '1.4.4';
 const DEFAULT_ADDON_NAME = 'UsenetStreamer';
 let serverInstance = null;
 const SERVER_HOST = '0.0.0.0';
@@ -477,6 +477,17 @@ let TRIAGE_BASE_OPTIONS = {
   nntpKeepAliveMs: TRIAGE_NNTP_KEEP_ALIVE_MS,
   healthCheckTimeoutMs: TRIAGE_TIME_BUDGET_MS,
 };
+let sharedPoolMonitorTimer = null;
+
+function buildSharedPoolOptions() {
+  if (!TRIAGE_NNTP_CONFIG) return null;
+  return {
+    nntpConfig: { ...TRIAGE_NNTP_CONFIG },
+    nntpMaxConnections: TRIAGE_NNTP_MAX_CONNECTIONS,
+    reuseNntpPool: TRIAGE_REUSE_POOL,
+    nntpKeepAliveMs: TRIAGE_NNTP_KEEP_ALIVE_MS,
+  };
+}
 
 const MAX_NEWZNAB_INDEXERS = newznabService.MAX_NEWZNAB_INDEXERS;
 const NEWZNAB_NUMBERED_KEYS = newznabService.NEWZNAB_NUMBERED_KEYS;
@@ -485,18 +496,45 @@ function maybePrewarmSharedNntpPool() {
   if (!TRIAGE_REUSE_POOL || !TRIAGE_NNTP_CONFIG) {
     return;
   }
-  preWarmNntpPool({
-    nntpConfig: { ...TRIAGE_NNTP_CONFIG },
-    nntpMaxConnections: TRIAGE_NNTP_MAX_CONNECTIONS,
-    reuseNntpPool: TRIAGE_REUSE_POOL,
-    nntpKeepAliveMs: TRIAGE_NNTP_KEEP_ALIVE_MS,
-  })
+  const options = buildSharedPoolOptions();
+  if (!options) return;
+  preWarmNntpPool(options)
     .then(() => {
       // console.log('[NZB TRIAGE] Pre-warmed NNTP pool with shared configuration');
     })
     .catch((err) => {
       console.warn('[NZB TRIAGE] Unable to pre-warm NNTP pool', err?.message || err);
     });
+}
+
+function triggerRequestTriagePrewarm(reason = 'request') {
+  if (!TRIAGE_REUSE_POOL || !TRIAGE_NNTP_CONFIG) {
+    return null;
+  }
+  const options = buildSharedPoolOptions();
+  if (!options) return null;
+  return preWarmNntpPool(options).catch((err) => {
+    console.warn(`[NZB TRIAGE] Unable to pre-warm NNTP pool (${reason})`, err?.message || err);
+  });
+}
+
+function restartSharedPoolMonitor() {
+  if (sharedPoolMonitorTimer) {
+    clearInterval(sharedPoolMonitorTimer);
+    sharedPoolMonitorTimer = null;
+  }
+  if (!TRIAGE_REUSE_POOL || !TRIAGE_NNTP_CONFIG) {
+    return;
+  }
+  const intervalMs = Math.max(30000, TRIAGE_NNTP_KEEP_ALIVE_MS || 120000);
+  sharedPoolMonitorTimer = setInterval(() => {
+    evictStaleSharedNntpPool().catch((err) => {
+      console.warn('[NZB TRIAGE] Failed to evict stale NNTP pool', err?.message || err);
+    });
+  }, intervalMs);
+  if (typeof sharedPoolMonitorTimer.unref === 'function') {
+    sharedPoolMonitorTimer.unref();
+  }
 }
 
 function rebuildRuntimeConfig({ log = true } = {}) {
@@ -588,6 +626,7 @@ function rebuildRuntimeConfig({ log = true } = {}) {
   };
 
   maybePrewarmSharedNntpPool();
+  restartSharedPoolMonitor();
   const resolvedAddonBase = ADDON_BASE_URL || `http://${SERVER_HOST}:${currentPort}`;
   easynewsService.reloadConfig({ addonBaseUrl: resolvedAddonBase, sharedSecret: ADDON_SHARED_SECRET });
 
@@ -896,8 +935,10 @@ function manifestHandler(req, res) {
 });
 
 async function streamHandler(req, res) {
+  const requestStartTs = Date.now();
   const { type, id } = req.params;
-  console.log(`[REQUEST] Received request for ${type} ID: ${id}`);
+  console.log(`[REQUEST] Received request for ${type} ID: ${id}`, { ts: new Date(requestStartTs).toISOString() });
+  let triagePrewarmPromise = null;
 
   let baseIdentifier = id;
   if (type === 'series' && typeof id === 'string') {
@@ -953,6 +994,7 @@ async function streamHandler(req, res) {
       indexerService.ensureIndexerManagerConfigured();
     }
     nzbdavService.ensureNzbdavConfigured();
+    triagePrewarmPromise = triggerRequestTriagePrewarm();
 
     const requestedEpisode = parseRequestedEpisode(type, id, req.query || {});
     const streamCacheKey = STREAM_CACHE_MAX_ENTRIES > 0
@@ -1217,7 +1259,7 @@ async function streamHandler(req, res) {
       }
     }
 
-    console.log('[REQUEST] Resolved title/year', { movieTitle, releaseYear });
+    console.log('[REQUEST] Resolved title/year', { movieTitle, releaseYear, elapsedMs: Date.now() - requestStartTs });
 
     let searchType;
     if (type === 'series') {
@@ -1542,7 +1584,7 @@ async function streamHandler(req, res) {
 
       finalNzbResults = finalNzbResults.map((result, index) => annotateNzbResult(result, index));
 
-      console.log(`${INDEXER_LOG_PREFIX} Final NZB selection: ${finalNzbResults.length} results`);
+      console.log(`${INDEXER_LOG_PREFIX} Final NZB selection: ${finalNzbResults.length} results`, { elapsedMs: Date.now() - requestStartTs });
     }
 
     const effectiveMaxSizeBytes = (() => {
@@ -1567,6 +1609,11 @@ async function streamHandler(req, res) {
     });
     if (dedupeEnabled) {
       finalNzbResults = dedupeResultsByTitle(finalNzbResults);
+    }
+
+    if (triagePrewarmPromise) {
+      await triagePrewarmPromise;
+      triagePrewarmPromise = null;
     }
 
     const logTopLanguages = () => {
@@ -2039,7 +2086,8 @@ async function streamHandler(req, res) {
       console.log(`[STREMIO] ${instantCount}/${streams.length} streams already cached in NZBDav`);
     }
 
-    console.log(`[STREMIO] Returning ${streams.length} NZB streams`);
+    const requestElapsedMs = Date.now() - requestStartTs;
+    console.log(`[STREMIO] Returning ${streams.length} NZB streams`, { elapsedMs: requestElapsedMs, ts: new Date().toISOString() });
 
     const responsePayload = { streams };
     if (streamCacheKey && cacheMeta) {
