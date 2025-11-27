@@ -22,7 +22,7 @@ let NZBDAV_CATEGORY_MOVIES = process.env.NZBDAV_CATEGORY_MOVIES || 'Movies';
 let NZBDAV_CATEGORY_SERIES = process.env.NZBDAV_CATEGORY_SERIES || 'Tv';
 let NZBDAV_CATEGORY_DEFAULT = process.env.NZBDAV_CATEGORY_DEFAULT || 'Movies';
 let NZBDAV_CATEGORY_OVERRIDE = (process.env.NZBDAV_CATEGORY || '').trim();
-let NZBDAV_POLL_INTERVAL_MS = 2000;
+let NZBDAV_POLL_INTERVAL_MS = 1000;
 let NZBDAV_POLL_TIMEOUT_MS = 80000;
 let NZBDAV_HISTORY_FETCH_LIMIT = (() => {
   const raw = Number(process.env.NZBDAV_HISTORY_FETCH_LIMIT);
@@ -40,7 +40,7 @@ function reloadConfig() {
   NZBDAV_CATEGORY_SERIES = process.env.NZBDAV_CATEGORY_SERIES || 'Tv';
   NZBDAV_CATEGORY_DEFAULT = process.env.NZBDAV_CATEGORY_DEFAULT || 'Movies';
   NZBDAV_CATEGORY_OVERRIDE = (process.env.NZBDAV_CATEGORY || '').trim();
-  NZBDAV_POLL_INTERVAL_MS = 2000;
+  NZBDAV_POLL_INTERVAL_MS = 1000;
   NZBDAV_POLL_TIMEOUT_MS = 80000;
   NZBDAV_HISTORY_FETCH_LIMIT = (() => {
     const raw = Number(process.env.NZBDAV_HISTORY_FETCH_LIMIT);
@@ -215,11 +215,81 @@ async function addNzbToNzbdav({ downloadUrl, cachedEntry = null, category, jobLa
   return { nzoId };
 }
 
-async function waitForNzbdavHistorySlot(nzoId, category) {
+async function getNzbdavQueueSlot(nzoId) {
+  ensureNzbdavConfigured();
+  const params = buildNzbdavApiParams('queue', { output: 'json' });
+  const headers = {};
+  if (NZBDAV_API_KEY) {
+    headers['x-api-key'] = NZBDAV_API_KEY;
+  }
+
+  try {
+    const response = await axios.get(`${NZBDAV_URL}/api`, {
+      params,
+      timeout: NZBDAV_API_TIMEOUT_MS,
+      headers,
+      validateStatus: (status) => status < 500
+    });
+
+    if (!response.data?.status && response.data?.status !== undefined) {
+      // Some APIs return status=true/false, others just return the queue object
+      // If explicit false, it's an error
+      return null;
+    }
+
+    const queue = response.data?.queue || response.data?.Queue;
+    const slots = queue?.slots || queue?.Slots || [];
+    return slots.find((entry) => {
+      const entryId = entry?.nzo_id || entry?.nzoId || entry?.NzoId;
+      return entryId === nzoId;
+    });
+  } catch (error) {
+    console.warn(`[NZBDAV] Failed to fetch queue: ${error.message}`);
+    return null;
+  }
+}
+
+async function waitForStreamableResource({ nzoId, category, jobName, requestedEpisode, requireCompleted = false }) {
   ensureNzbdavConfigured();
   const deadline = Date.now() + NZBDAV_POLL_TIMEOUT_MS;
 
   while (Date.now() < deadline) {
+    // 1. Check Queue for early streaming access (if completion not required)
+    if (!requireCompleted) {
+      const queueSlot = await getNzbdavQueueSlot(nzoId);
+      if (queueSlot) {
+        const queueFilename = queueSlot.filename || jobName;
+        if (queueFilename) {
+          try {
+            const bestFile = await findBestVideoFile({
+              category,
+              jobName: queueFilename,
+              requestedEpisode
+            });
+
+            // Only start early streaming if we have a decent chunk of data (e.g., > 10MB)
+            // to avoid racing with empty file creation
+            if (bestFile && bestFile.size > 10 * 1024 * 1024) {
+              console.log(`[NZBDAV] Early stream detection success for ${queueFilename} (${bestFile.size} bytes)`);
+              return {
+                status: 'downloading',
+                nzoId,
+                category,
+                jobName: queueFilename,
+                viewPath: bestFile.viewPath,
+                size: bestFile.size,
+                fileName: bestFile.name,
+                queueSize: queueSlot.mb ? Number(queueSlot.mb) * 1024 * 1024 : null
+              };
+            }
+          } catch (error) {
+            // Ignore WebDAV errors during polling (folder might not exist yet)
+          }
+        }
+      }
+    }
+
+    // 2. Check History for completion
     const params = buildNzbdavApiParams('history', {
       start: '0',
       limit: '50',
@@ -231,39 +301,41 @@ async function waitForNzbdavHistorySlot(nzoId, category) {
       headers['x-api-key'] = NZBDAV_API_KEY;
     }
 
-    const response = await axios.get(`${NZBDAV_URL}/api`, {
-      params,
-      timeout: NZBDAV_HISTORY_TIMEOUT_MS,
-      headers,
-      validateStatus: (status) => status < 500
-    });
-
-    if (!response.data?.status) {
-      const errorMessage = response.data?.error || `history returned status ${response.status}`;
-      throw new Error(`[NZBDAV] Failed to query history: ${errorMessage}`);
+    let historyResponse;
+    try {
+      historyResponse = await axios.get(`${NZBDAV_URL}/api`, {
+        params,
+        timeout: NZBDAV_HISTORY_TIMEOUT_MS,
+        headers,
+        validateStatus: (status) => status < 500
+      });
+    } catch (error) {
+      console.warn(`[NZBDAV] History check failed: ${error.message}`);
     }
 
-    const history = response.data?.history || response.data?.History;
-    const slots = history?.slots || history?.Slots || [];
-    const slot = slots.find((entry) => {
-      const entryId = entry?.nzo_id || entry?.nzoId || entry?.NzoId;
-      return entryId === nzoId;
-    });
+    if (historyResponse?.data?.status) {
+      const history = historyResponse.data?.history || historyResponse.data?.History;
+      const slots = history?.slots || history?.Slots || [];
+      const slot = slots.find((entry) => {
+        const entryId = entry?.nzo_id || entry?.nzoId || entry?.NzoId;
+        return entryId === nzoId;
+      });
 
-    if (slot) {
-      const status = (slot.status || slot.Status || '').toString().toLowerCase();
-      if (status === 'completed') {
-        console.log(`[NZBDAV] NZB ${nzoId} completed in ${category}`);
-        return slot;
-      }
-      if (status === 'failed') {
-        const failMessage = slot.fail_message || slot.failMessage || slot.FailMessage || 'Unknown NZBDav error';
-        const failureError = new Error(`[NZBDAV] NZB failed: ${failMessage}`);
-        failureError.isNzbdavFailure = true;
-        failureError.failureMessage = failMessage;
-        failureError.nzoId = nzoId;
-        failureError.category = category;
-        throw failureError;
+      if (slot) {
+        const status = (slot.status || slot.Status || '').toString().toLowerCase();
+        if (status === 'completed') {
+          console.log(`[NZBDAV] NZB ${nzoId} completed in ${category}`);
+          return { status: 'completed', slot };
+        }
+        if (status === 'failed') {
+          const failMessage = slot.fail_message || slot.failMessage || slot.FailMessage || 'Unknown NZBDav error';
+          const failureError = new Error(`[NZBDAV] NZB failed: ${failMessage}`);
+          failureError.isNzbdavFailure = true;
+          failureError.failureMessage = failMessage;
+          failureError.nzoId = nzoId;
+          failureError.category = category;
+          throw failureError;
+        }
       }
     }
 
@@ -271,6 +343,18 @@ async function waitForNzbdavHistorySlot(nzoId, category) {
   }
 
   throw new Error('[NZBDAV] Timeout while waiting for NZB to become streamable');
+}
+
+// Deprecated: maintained for backward compatibility or simple checks
+async function waitForNzbdavHistorySlot(nzoId, category) {
+  // Use requireCompleted: true to force waiting until the job is fully done
+  // This preserves the original behavior of this function
+  const result = await waitForStreamableResource({ nzoId, category, requireCompleted: true });
+  if (result.status === 'completed') {
+    return result.slot;
+  }
+  // This path should not be reachable if requireCompleted is true, unless timeout occurs which throws
+  return null;
 }
 
 async function fetchCompletedNzbdavHistory(categories = []) {
@@ -470,18 +554,21 @@ async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisod
 
   for (const mode of attempts) {
     try {
-      let slot = null;
       let nzoId = null;
       let slotCategory = category;
       let slotJobName = title;
+      let streamResource = null;
 
       if (mode === 'reuse') {
         const reuseCategory = existingSlot?.category || category;
-        slot = await waitForNzbdavHistorySlot(existingSlot.nzoId, reuseCategory);
         nzoId = existingSlot.nzoId;
-        slotCategory = slot?.category || slot?.Category || reuseCategory;
-        slotJobName = slot?.job_name || slot?.JobName || slot?.name || slot?.Name || existingSlot?.jobName || title;
-        console.log(`[NZBDAV] Reusing completed NZB ${slotJobName} (${nzoId})`);
+        // For reuse, we might still want to check if it's available (history or downloading)
+        streamResource = await waitForStreamableResource({
+          nzoId,
+          category: reuseCategory,
+          jobName: existingSlot.jobName || title,
+          requestedEpisode
+        });
       } else {
         const cachedNzbEntry = inlineCachedEntry || cache.getVerifiedNzbCacheEntry(downloadUrl);
         if (cachedNzbEntry) {
@@ -494,10 +581,30 @@ async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisod
           jobLabel: title,
         });
         nzoId = added.nzoId;
-        slot = await waitForNzbdavHistorySlot(nzoId, category);
-        slotCategory = slot?.category || slot?.Category || category;
-        slotJobName = slot?.job_name || slot?.JobName || slot?.name || slot?.Name || title;
+        streamResource = await waitForStreamableResource({
+          nzoId,
+          category,
+          jobName: title,
+          requestedEpisode
+        });
       }
+
+      if (streamResource.status === 'downloading') {
+        // Early exit for downloading files
+        return {
+          nzoId,
+          category: streamResource.category,
+          jobName: streamResource.jobName,
+          viewPath: streamResource.viewPath,
+          size: streamResource.size,
+          fileName: streamResource.fileName
+        };
+      }
+
+      // If completed, process the history slot
+      const slot = streamResource.slot;
+      slotCategory = slot?.category || slot?.Category || category;
+      slotJobName = slot?.job_name || slot?.JobName || slot?.name || slot?.Name || title;
 
       if (!slotJobName) {
         throw new Error('[NZBDAV] Unable to determine job name from history');
