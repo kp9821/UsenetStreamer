@@ -609,3 +609,38 @@ button.ghost.danger:hover {
     grid-template-columns: 1fr;
   }
 }
+
+/* Streaming Mode Section */
+.streaming-mode-section {
+  background: linear-gradient(135deg, rgba(53, 201, 255, 0.08) 0%, rgba(79, 140, 255, 0.05) 100%);
+  border: 1px solid rgba(53, 201, 255, 0.25);
+}
+
+.streaming-mode-section h3 {
+  color: var(--accent);
+}
+
+.info-box {
+  background: rgba(53, 201, 255, 0.08);
+  border: 1px solid rgba(53, 201, 255, 0.3);
+  border-radius: var(--radius-sm);
+  padding: 1rem 1.25rem;
+  margin-top: 1rem;
+}
+
+.info-box strong {
+  color: var(--accent);
+  display: block;
+  margin-bottom: 0.5rem;
+}
+
+.info-box p {
+  color: var(--text-secondary);
+  margin: 0.25rem 0;
+  font-size: 0.9rem;
+}
+
+/* Mode-based visibility */
+.native-mode-hidden {
+  display: none !important;
+}

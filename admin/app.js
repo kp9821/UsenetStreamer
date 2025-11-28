@@ -20,6 +20,10 @@
   const languageCheckboxes = Array.from(configForm.querySelectorAll('input[data-language-option]'));
   const languageSelector = configForm.querySelector('[data-language-selector]');
   const versionBadge = document.getElementById('addonVersionBadge');
+  const streamingModeSelect = document.getElementById('streamingModeSelect');
+  const nativeModeNotice = document.getElementById('nativeModeNotice');
+  const indexerManagerGroup = document.getElementById('indexerManagerGroup');
+  const nzbdavGroup = document.getElementById('nzbdavGroup');
 
   let currentManifestUrl = '';
   let copyStatusTimer = null;
@@ -730,6 +734,7 @@
       refreshNewznabFieldNames();
       syncHealthControls();
       syncSortingControls();
+      syncStreamingModeControls();
       syncManagerControls();
       syncNewznabControls();
       configSection.classList.remove('hidden');
@@ -893,10 +898,56 @@
 
   function syncManagerControls() {
     if (!managerSelect) return;
+    const streamingMode = streamingModeSelect?.value || 'nzbdav';
     const managerValue = managerSelect.value || 'none';
     const managerFields = configForm.querySelectorAll('[data-manager-field]');
-    managerFields.forEach((field) => field.classList.toggle('hidden', managerValue === 'none'));
+    
+    // In native mode, force manager to 'none' and hide manager options
+    if (streamingMode === 'native') {
+      managerFields.forEach((field) => field.classList.add('hidden'));
+    } else {
+      managerFields.forEach((field) => field.classList.toggle('hidden', managerValue === 'none'));
+    }
     syncSaveGuard();
+  }
+
+  function syncStreamingModeControls() {
+    const mode = streamingModeSelect?.value || 'nzbdav';
+    const isNativeMode = mode === 'native';
+    
+    // Show/hide native mode notice
+    if (nativeModeNotice) {
+      nativeModeNotice.classList.toggle('hidden', !isNativeMode);
+    }
+    
+    // Hide NZBDav section in native mode
+    if (nzbdavGroup) {
+      nzbdavGroup.classList.toggle('hidden', isNativeMode);
+    }
+    
+    // In native mode, force manager to 'none' and disable the select
+    if (indexerManagerGroup && managerSelect) {
+      if (isNativeMode) {
+        // Force to newznab only in native mode
+        managerSelect.value = 'none';
+        managerSelect.disabled = true;
+        // Add a hint that manager is disabled
+        const existingHint = indexerManagerGroup.querySelector('.native-mode-hint');
+        if (!existingHint) {
+          const hint = document.createElement('p');
+          hint.className = 'hint native-mode-hint';
+          hint.textContent = 'Prowlarr/NZBHydra disabled in Windows Native mode. Use direct Newznab indexers below.';
+          const h3 = indexerManagerGroup.querySelector('h3');
+          if (h3) h3.after(hint);
+        }
+      } else {
+        managerSelect.disabled = false;
+        const existingHint = indexerManagerGroup.querySelector('.native-mode-hint');
+        if (existingHint) existingHint.remove();
+      }
+    }
+    
+    syncManagerControls();
   }
 
   function syncNewznabControls() {
@@ -1020,6 +1071,12 @@
     });
   }
 
+  if (streamingModeSelect) {
+    streamingModeSelect.addEventListener('change', () => {
+      syncStreamingModeControls();
+    });
+  }
+
   if (easynewsToggle) {
     easynewsToggle.addEventListener('change', syncSaveGuard);
   }
@@ -1043,6 +1100,7 @@
   }
   syncHealthControls();
   syncSortingControls();
+  syncStreamingModeControls();
   syncManagerControls();
   syncNewznabControls();
   applyQualitySelectionsFromHidden();

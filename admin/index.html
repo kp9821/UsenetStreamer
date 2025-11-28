@@ -29,7 +29,26 @@
 
     <section class="card hidden" id="configSection">
       <form id="configForm">
-        <section class="group">
+        <section class="group streaming-mode-section">
+          <h3>Streaming Mode</h3>
+          <p class="hint">Choose how streams are delivered to Stremio. Windows Native mode requires Stremio v5 on Windows desktop.</p>
+          <div class="field-grid">
+            <label>
+              <select name="STREAMING_MODE" id="streamingModeSelect">
+                <option value="nzbdav">NZBDav Mode (All Platforms)</option>
+                <option value="native">Windows Native Mode (Stremio v5 Desktop)</option>
+              </select>
+              <span class="field-hint" id="streamingModeHint">NZBDav mode uses WebDAV streaming and works on all platforms. Windows Native mode streams directly via NNTP (experimental, Windows only).</span>
+            </label>
+          </div>
+          <div id="nativeModeNotice" class="info-box hidden">
+            <strong>⚡ Windows Native Mode</strong>
+            <p>Streams NZBs directly using your NNTP provider credentials. No NZBDav required. Only works with Stremio v5 on Windows desktop.</p>
+            <p>Prowlarr/NZBHydra are disabled in this mode — use direct Newznab indexers only.</p>
+          </div>
+        </section>
+
+        <section class="group" id="indexerManagerGroup">
           <h3>Indexer Manager</h3>
           <div class="field-grid">
             <label>Manager Type
@@ -277,7 +296,7 @@
           </div>
         </section>
 
-        <section class="group">
+        <section class="group" id="nzbdavGroup">
           <h3>NZBDav Connection</h3>
           <div class="field-grid">
             <label>NZBDav URL

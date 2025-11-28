@@ -226,8 +226,14 @@ app.use((req, res, next) => {
 
 // Additional authentication middleware is registered after admin routes are defined
 
+// Streaming mode: 'nzbdav' (default) or 'native' (Windows Stremio v5 only)
+let STREAMING_MODE = (process.env.STREAMING_MODE || 'nzbdav').trim().toLowerCase();
+if (!['nzbdav', 'native'].includes(STREAMING_MODE)) STREAMING_MODE = 'nzbdav';
+
 // Configure indexer manager (Prowlarr or NZBHydra)
+// Note: In native streaming mode, manager is forced to 'none'
 let INDEXER_MANAGER = (process.env.INDEXER_MANAGER || 'none').trim().toLowerCase();
+if (STREAMING_MODE === 'native') INDEXER_MANAGER = 'none'; // Force newznab-only in native mode
 let INDEXER_MANAGER_URL = (process.env.INDEXER_MANAGER_URL || process.env.PROWLARR_URL || '').trim();
 let INDEXER_MANAGER_API_KEY = (process.env.INDEXER_MANAGER_API_KEY || process.env.PROWLARR_API_KEY || '').trim();
 let INDEXER_MANAGER_LABEL = INDEXER_MANAGER === 'nzbhydra'
@@ -438,6 +444,28 @@ function buildTriageNntpConfig() {
   };
 }
 
+/**
+ * Build NNTP servers array for native Stremio v5 streaming.
+ * Format: nntps://{user}:{pass}@{host}:{port}/{connections}
+ * or nntp:// for non-TLS connections
+ */
+function buildNntpServersArray() {
+  const host = (process.env.NZB_TRIAGE_NNTP_HOST || '').trim();
+  if (!host) return [];
+  
+  const port = toPositiveInt(process.env.NZB_TRIAGE_NNTP_PORT, 119);
+  const user = (process.env.NZB_TRIAGE_NNTP_USER || '').trim();
+  const pass = (process.env.NZB_TRIAGE_NNTP_PASS || '').trim();
+  const useTLS = toBoolean(process.env.NZB_TRIAGE_NNTP_TLS, false);
+  const connections = toPositiveInt(process.env.NZB_TRIAGE_NNTP_MAX_CONNECTIONS, 12);
+  
+  const protocol = useTLS ? 'nntps' : 'nntp';
+  const auth = user && pass ? `${encodeURIComponent(user)}:${encodeURIComponent(pass)}@` : '';
+  const serverUrl = `${protocol}://${auth}${host}:${port}/${connections}`;
+  
+  return [serverUrl];
+}
+
 let INDEXER_SORT_MODE = normalizeSortMode(process.env.NZB_SORT_MODE, 'quality_then_size');
 let INDEXER_PREFERRED_LANGUAGES = resolvePreferredLanguages(process.env.NZB_PREFERRED_LANGUAGE, []);
 let INDEXER_DEDUP_ENABLED = toBoolean(process.env.NZB_DEDUP_ENABLED, true);
@@ -543,11 +571,17 @@ function rebuildRuntimeConfig({ log = true } = {}) {
   const previousBaseUrl = ADDON_BASE_URL;
   const previousSharedSecret = ADDON_SHARED_SECRET;
 
+  // Streaming mode: 'nzbdav' (default) or 'native' (Windows Stremio v5 only)
+  STREAMING_MODE = (process.env.STREAMING_MODE || 'nzbdav').trim().toLowerCase();
+  if (!['nzbdav', 'native'].includes(STREAMING_MODE)) STREAMING_MODE = 'nzbdav';
+
   ADDON_BASE_URL = (process.env.ADDON_BASE_URL || '').trim();
   ADDON_SHARED_SECRET = (process.env.ADDON_SHARED_SECRET || '').trim();
   ADDON_NAME = (process.env.ADDON_NAME || DEFAULT_ADDON_NAME).trim() || DEFAULT_ADDON_NAME;
 
   INDEXER_MANAGER = (process.env.INDEXER_MANAGER || 'none').trim().toLowerCase();
+  // Force newznab-only in native streaming mode
+  if (STREAMING_MODE === 'native') INDEXER_MANAGER = 'none';
   INDEXER_MANAGER_URL = (process.env.INDEXER_MANAGER_URL || process.env.PROWLARR_URL || '').trim();
   INDEXER_MANAGER_API_KEY = (process.env.INDEXER_MANAGER_API_KEY || process.env.PROWLARR_API_KEY || '').trim();
   INDEXER_MANAGER_LABEL = INDEXER_MANAGER === 'nzbhydra'
@@ -653,6 +687,7 @@ rebuildRuntimeConfig({ log: false });
 
 const ADMIN_CONFIG_KEYS = [
   'PORT',
+  'STREAMING_MODE',
   'ADDON_BASE_URL',
   'ADDON_NAME',
   'ADDON_SHARED_SECRET',
@@ -917,11 +952,15 @@ function ensureAddonConfigured() {
 function manifestHandler(req, res) {
   ensureAddonConfigured();
 
+  const description = STREAMING_MODE === 'native'
+    ? 'Native Usenet streaming for Stremio v5 (Windows) - NZB sources via direct Newznab indexers'
+    : 'Usenet-powered instant streams for Stremio via Prowlarr/NZBHydra and NZBDav';
+
   res.json({
-    id: 'com.usenet.streamer',
+    id: STREAMING_MODE === 'native' ? 'com.usenet.streamer.native' : 'com.usenet.streamer',
     version: ADDON_VERSION,
     name: ADDON_NAME,
-    description: 'Usenet-powered instant streams for Stremio via Prowlarr/NZBHydra and NZBDav',
+    description,
     logo: `${ADDON_BASE_URL.replace(/\/$/, '')}/assets/icon.png`,
     resources: ['stream'],
     types: ['movie', 'series', 'channel', 'tv'],
@@ -993,7 +1032,10 @@ async function streamHandler(req, res) {
     if (INDEXER_MANAGER !== 'none') {
       indexerService.ensureIndexerManagerConfigured();
     }
-    nzbdavService.ensureNzbdavConfigured();
+    // Skip NZBDav config check in native streaming mode
+    if (STREAMING_MODE !== 'native') {
+      nzbdavService.ensureNzbdavConfigured();
+    }
     triagePrewarmPromise = triggerRequestTriagePrewarm();
 
     const requestedEpisode = parseRequestedEpisode(type, id, req.query || {});
@@ -1819,15 +1861,18 @@ async function streamHandler(req, res) {
         }
       : null;
 
-    const categoryForType = nzbdavService.getNzbdavCategory(type);
+    // Skip NZBDav history fetching in native streaming mode
+    const categoryForType = STREAMING_MODE !== 'native' ? nzbdavService.getNzbdavCategory(type) : null;
     let historyByTitle = new Map();
-    try {
-      historyByTitle = await nzbdavService.fetchCompletedNzbdavHistory([categoryForType]);
-      if (historyByTitle.size > 0) {
-        console.log(`[NZBDAV] Loaded ${historyByTitle.size} completed NZBs for instant playback detection (category=${categoryForType})`);
+    if (STREAMING_MODE !== 'native') {
+      try {
+        historyByTitle = await nzbdavService.fetchCompletedNzbdavHistory([categoryForType]);
+        if (historyByTitle.size > 0) {
+          console.log(`[NZBDAV] Loaded ${historyByTitle.size} completed NZBs for instant playback detection (category=${categoryForType})`);
+        }
+      } catch (historyError) {
+        console.warn(`[NZBDAV] Unable to load NZBDav history for instant detection: ${historyError.message}`);
       }
-    } catch (historyError) {
-      console.warn(`[NZBDAV] Unable to load NZBDav history for instant detection: ${historyError.message}`);
     }
 
     const addonBaseUrl = ADDON_BASE_URL.replace(/\/$/, '');
@@ -1968,7 +2013,7 @@ async function streamHandler(req, res) {
         const streamUrl = `${addonBaseUrl}${tokenSegment}/nzb/stream?${baseParams.toString()}`;
         const tags = [];
         if (triageTag) tags.push(triageTag);
-        if (isInstant) tags.push('⚡ Instant');
+        if (isInstant && STREAMING_MODE !== 'native') tags.push('⚡ Instant');
         if (preferredLanguageMatches.length > 0) {
           preferredLanguageMatches.forEach((language) => tags.push(language));
         }
@@ -1977,18 +2022,30 @@ async function streamHandler(req, res) {
         if (sizeString) tags.push(sizeString);
         const addonLabel = ADDON_NAME || DEFAULT_ADDON_NAME;
         const name = qualitySummary ? `${addonLabel} ${qualitySummary}` : addonLabel;
-        const behaviorHints = {
-          notWebReady: true,
-          externalPlayer: {
-            isRequired: false,
-            name: 'NZBDav Instant Stream'
-          }
-        };
-
-        if (isInstant) {
-          behaviorHints.cached = true;
-          if (historySlot) {
-            behaviorHints.cachedFromHistory = true;
+        
+        // Build behavior hints based on streaming mode
+        let behaviorHints;
+        if (STREAMING_MODE === 'native') {
+          // Native mode: minimal behaviorHints for Stremio v5 native NZB streaming
+          behaviorHints = {
+            bingeGroup: `usenetstreamer-${detectedResolutionToken || 'unknown'}`,
+            videoSize: result.size || undefined,
+            filename: result.title || undefined,
+          };
+        } else {
+          // NZBDav mode: existing WebDAV-based streaming
+          behaviorHints = {
+            notWebReady: true,
+            externalPlayer: {
+              isRequired: false,
+              name: 'NZBDav Instant Stream'
+            }
+          };
+          if (isInstant) {
+            behaviorHints.cached = true;
+            if (historySlot) {
+              behaviorHints.cachedFromHistory = true;
+            }
           }
         }
 
@@ -2014,49 +2071,68 @@ async function streamHandler(req, res) {
           triageLogSuppressed = true;
         }
 
-        const stream = {
-          title: `${result.title}\n${tags.filter(Boolean).join(' • ')}\n${result.indexer}`,
-          name,
-          url: streamUrl,
-          behaviorHints,
-          meta: {
-            originalTitle: result.title,
-            indexer: result.indexer,
-            size: result.size,
-            quality,
-            age: result.age,
-            type: 'nzb',
-            cached: Boolean(isInstant),
-            cachedFromHistory: Boolean(historySlot),
-            languages: releaseLanguages,
-            indexerLanguage: sourceLanguage,
-            resolution: detectedResolutionToken || null,
-            preferredLanguageMatch: preferredLanguageHit,
-            preferredLanguageName: matchedPreferredLanguage,
-            preferredLanguageNames: preferredLanguageMatches,
-          }
-        };
-        if (triageTag || triageInfo || triageOutcome?.timedOut || !triageApplied) {
-          if (triageInfo) {
-            stream.meta.healthCheck = {
-              status: triageStatus,
-              blockers: triageInfo.blockers || [],
-              warnings: triageInfo.warnings || [],
-              fileCount: triageInfo.fileCount,
-              archiveCheck: archiveCheckStatus,
-              missingArticlesCheck: missingArticlesStatus,
-              applied: triageApplied,
-              inheritedFromTitle: triageDerivedFromTitle,
-            };
-            stream.meta.healthCheck.archiveFindings = archiveFindings;
-            if (triageInfo.sourceDownloadUrl) {
-              stream.meta.healthCheck.sourceDownloadUrl = triageInfo.sourceDownloadUrl;
+        // Build the stream object based on streaming mode
+        let stream;
+        if (STREAMING_MODE === 'native') {
+          // Native mode: Stremio v5 native NZB streaming
+          const nntpServers = buildNntpServersArray();
+          stream = {
+            name,
+            description: `${result.title}\n${result.indexer} • ${sizeString}\n${tags.filter(Boolean).join(' • ')}`,
+            nzbUrl: result.downloadUrl,
+            servers: nntpServers.length > 0 ? nntpServers : undefined,
+            url: undefined,
+            infoHash: undefined,
+            behaviorHints,
+          };
+        } else {
+          // NZBDav mode: WebDAV-based streaming
+          stream = {
+            title: `${result.title}\n${tags.filter(Boolean).join(' • ')}\n${result.indexer}`,
+            name,
+            url: streamUrl,
+            behaviorHints,
+            meta: {
+              originalTitle: result.title,
+              indexer: result.indexer,
+              size: result.size,
+              quality,
+              age: result.age,
+              type: 'nzb',
+              cached: Boolean(isInstant),
+              cachedFromHistory: Boolean(historySlot),
+              languages: releaseLanguages,
+              indexerLanguage: sourceLanguage,
+              resolution: detectedResolutionToken || null,
+              preferredLanguageMatch: preferredLanguageHit,
+              preferredLanguageName: matchedPreferredLanguage,
+              preferredLanguageNames: preferredLanguageMatches,
             }
-          } else {
-            stream.meta.healthCheck = {
-              status: triageOutcome?.timedOut ? 'pending' : 'not-run',
-              applied: false,
-            };
+          };
+          
+          // Add health check metadata for NZBDav mode
+          if (triageTag || triageInfo || triageOutcome?.timedOut || !triageApplied) {
+            if (triageInfo) {
+              stream.meta.healthCheck = {
+                status: triageStatus,
+                blockers: triageInfo.blockers || [],
+                warnings: triageInfo.warnings || [],
+                fileCount: triageInfo.fileCount,
+                archiveCheck: archiveCheckStatus,
+                missingArticlesCheck: missingArticlesStatus,
+                applied: triageApplied,
+                inheritedFromTitle: triageDerivedFromTitle,
+              };
+              stream.meta.healthCheck.archiveFindings = archiveFindings;
+              if (triageInfo.sourceDownloadUrl) {
+                stream.meta.healthCheck.sourceDownloadUrl = triageInfo.sourceDownloadUrl;
+              }
+            } else {
+              stream.meta.healthCheck = {
+                status: triageOutcome?.timedOut ? 'pending' : 'not-run',
+                applied: false,
+              };
+            }
           }
         }
 
@@ -2081,13 +2157,17 @@ async function streamHandler(req, res) {
 
     const streams = instantStreams.concat(regularStreams);
 
-    const instantCount = streams.filter((stream) => stream?.meta?.cached).length;
-    if (instantCount > 0) {
-      console.log(`[STREMIO] ${instantCount}/${streams.length} streams already cached in NZBDav`);
+    // Log cached streams count (only relevant for NZBDav mode)
+    if (STREAMING_MODE !== 'native') {
+      const instantCount = streams.filter((stream) => stream?.meta?.cached).length;
+      if (instantCount > 0) {
+        console.log(`[STREMIO] ${instantCount}/${streams.length} streams already cached in NZBDav`);
+      }
     }
 
     const requestElapsedMs = Date.now() - requestStartTs;
-    console.log(`[STREMIO] Returning ${streams.length} NZB streams`, { elapsedMs: requestElapsedMs, ts: new Date().toISOString() });
+    const modeLabel = STREAMING_MODE === 'native' ? 'native NZB' : 'NZB';
+    console.log(`[STREMIO] Returning ${streams.length} ${modeLabel} streams`, { elapsedMs: requestElapsedMs, ts: new Date().toISOString() });
 
     const responsePayload = { streams };
     if (streamCacheKey && cacheMeta) {
