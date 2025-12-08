@@ -2285,6 +2285,22 @@ async function streamHandler(req, res) {
         const triageDerivedFromTitle = Boolean(!directTriageInfo && fallbackAllowed && fallbackTriageInfo);
         const triageStatus = triageInfo?.status || (triageApplied ? 'unknown' : 'not-run');
         if (INDEXER_HIDE_BLOCKED_RESULTS && triageStatus === 'blocked') {
+          if (triageInfo) {
+            console.log('[STREMIO][TRIAGE] Hiding blocked stream', {
+              title: result.title,
+              downloadUrl: result.downloadUrl,
+              indexer: result.indexer,
+              blockers: triageInfo.blockers || [],
+              warnings: triageInfo.warnings || [],
+              archiveFindings: triageInfo.archiveFindings || [],
+            });
+          } else {
+            console.log('[STREMIO][TRIAGE] Hiding blocked stream with missing triageInfo', {
+              title: result.title,
+              downloadUrl: result.downloadUrl,
+              indexer: result.indexer,
+            });
+          }
           return;
         }
         let triagePriority = 1;
@@ -2339,6 +2355,24 @@ async function streamHandler(req, res) {
           if (missingArticlesFailure) missingArticlesStatus = 'failed';
           else if (missingArticlesSuccess) missingArticlesStatus = 'passed';
           else if (archiveFindings.length > 0) missingArticlesStatus = 'inconclusive';
+        }
+
+        if (triageApplied || triageDerivedFromTitle) {
+          console.log('[STREMIO][TRIAGE] Stream decision', {
+            title: result.title,
+            downloadUrl: result.downloadUrl,
+            indexer: result.indexer,
+            triageStatus,
+            triageApplied,
+            triageDerivedFromTitle,
+            blockers: triageInfo?.blockers || [],
+            warnings: triageInfo?.warnings || [],
+            archiveFindings,
+            archiveCheckStatus,
+            missingArticlesStatus,
+            timedOut: Boolean(triageOutcome?.timedOut),
+            decisionSource: triageApplied ? 'direct' : 'title-fallback',
+          });
         }
 
         if (historySlot?.nzoId) {

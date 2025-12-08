@@ -3,15 +3,22 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
+const { applyRuntimeEnv } = require('../config/runtimeEnv');
 const { triageNzbs, closeSharedNntpPool } = require('../src/services/triage');
+
+applyRuntimeEnv();
 
 async function main() {
   const rootDir = process.cwd();
-  const nzbDir = path.join(rootDir, 'nzbs');
-
-  if (!fs.existsSync(nzbDir) || !fs.statSync(nzbDir).isDirectory()) {
-    console.error(`Expected nzb folder at ${nzbDir}, but it was not found.`);
+  const nzbDir = resolveNzbDir(rootDir);
+  if (!nzbDir) {
+    console.error('No NZB directory found. Checked test_nzbs, nzbs, and provided overrides.');
     process.exit(1);
+  }
+  console.log(`[triage-test] Using NZB directory: ${nzbDir}`);
+  const effectiveNntpHost = process.env.NZB_TRIAGE_NNTP_HOST;
+  if (!effectiveNntpHost) {
+    console.warn('[triage-test] Warning: NZB_TRIAGE_NNTP_HOST is not set. Archive inspections will be skipped.');
   }
 
   const nzbFiles = fs.readdirSync(nzbDir).filter((file) => file.toLowerCase().endsWith('.nzb'));
@@ -188,3 +195,22 @@ main().catch((err) => {
   console.error('Triage script crashed:', err);
   process.exit(1);
 });
+
+function resolveNzbDir(rootDir) {
+  const cliArg = process.argv[2] ? process.argv[2].trim() : '';
+  const envDir = normalizeEnv(process.env.NZB_TRIAGE_TEST_DIR);
+  const candidates = [cliArg, envDir, 'test_nzbs', 'nzbs']
+    .filter(Boolean)
+    .map((entry) => (path.isAbsolute(entry) ? entry : path.join(rootDir, entry)));
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+        return candidate;
+      }
+    } catch (err) {
+      // Ignore filesystem errors and continue
+    }
+  }
+  return null;
+}

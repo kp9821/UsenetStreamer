@@ -1,6 +1,7 @@
 const { parseStringPromise } = require('xml2js');
 const fs = require('fs/promises');
 const path = require('path');
+const { isVideoFileName } = require('../../utils/parsers');
 const NNTPModule = require('nntp/lib/nntp');
 const NNTP = typeof NNTPModule === 'function' ? NNTPModule : NNTPModule?.NNTP;
 function timingLog(event, details) {
@@ -8,7 +9,10 @@ function timingLog(event, details) {
   // console.log(`[NZB TRIAGE][TIMING] ${event}`, payload);
 }
 
-const ARCHIVE_EXTENSIONS = new Set(['.rar', '.r00', '.r01', '.r02', '.7z']);
+const ARCHIVE_EXTENSIONS = new Set(['.rar', '.r00', '.r01', '.r02', '.7z', '.zip']);
+const VIDEO_FILE_EXTENSIONS = ['.mkv', '.mp4', '.mov', '.avi', '.ts', '.m4v', '.mpg', '.mpeg', '.wmv', '.flv', '.webm'];
+const SPLIT_SEVEN_Z_REGEX = /\.7z\.(\d{2,3})$/i;
+const ARCHIVE_ONLY_MIN_PARTS = 10;
 const RAR4_SIGNATURE = Buffer.from([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00]);
 const RAR5_SIGNATURE = Buffer.from([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]);
 
@@ -19,7 +23,7 @@ const DEFAULT_OPTIONS = {
   archiveDirs: [],
   nntpConfig: null,
   healthCheckTimeoutMs: 35000,
-  maxDecodedBytes: 16 * 1024,
+  maxDecodedBytes: 256 * 1024,
   nntpMaxConnections: 60,
   reuseNntpPool: true,
   nntpKeepAliveMs: 120000 ,
@@ -300,9 +304,16 @@ async function analyzeSingleNzb(raw, ctx) {
   const blockers = new Set();
   const warnings = new Set();
   const archiveFindings = [];
-  const archiveCandidates = dedupeArchiveCandidates(files.filter(isArchiveFile));
+  const archiveFiles = files.filter(isArchiveFile);
+  const archiveCandidates = dedupeArchiveCandidates(archiveFiles);
   const checkedSegments = new Set();
   let primaryArchive = null;
+
+  const hasPlayableVideo = files.some((file) => {
+    const name = file.filename || guessFilenameFromSubject(file.subject) || '';
+    return isPlayableVideoName(name);
+  });
+
 
   const runStatCheck = async (archive, segment) => {
     const segmentId = segment?.id;
@@ -416,7 +427,7 @@ async function analyzeSingleNzb(raw, ctx) {
     if (ctx.nntpError) warnings.add(`nntp-error:${ctx.nntpError.code ?? ctx.nntpError.message}`);
     else warnings.add('nntp-disabled');
   } else {
-    const archiveWithSegments = archiveCandidates.find((candidate) => candidate.segments.length > 0);
+    const archiveWithSegments = selectArchiveForInspection(archiveCandidates);
     if (archiveWithSegments) {
       const nntpResult = await inspectArchiveViaNntp(archiveWithSegments, ctx);
       archiveFindings.push({
@@ -561,11 +572,85 @@ function isArchiveFile(file) {
   return /^\.r\d{2}$/i.test(ext);
 }
 
+function isArchiveEntryName(name) {
+  if (!name) return false;
+  const lower = name.toLowerCase();
+  return /\.r\d{2}(?:\b|$)/.test(lower)
+    || /\.part\d+\.rar/.test(lower)
+    || lower.endsWith('.rar')
+    || lower.endsWith('.7z')
+    || lower.endsWith('.zip');
+}
+
+function isPlayableVideoName(name) {
+  if (!name) return false;
+  if (!isVideoFileName(name)) return false;
+  return !/sample|proof/i.test(name);
+}
+
+function isSplitSevenZipFilename(name) {
+  if (!name) return false;
+  return SPLIT_SEVEN_Z_REGEX.test(name.trim());
+}
+
+function analyzeBufferFilenames(buffer) {
+  if (!buffer || buffer.length === 0) {
+    return { nested: 0, playable: 0, samples: [] };
+  }
+  const ascii = buffer.toString('latin1');
+  const filenameRegex = /[A-Za-z0-9_\-()\[\]\s]{3,120}\.[A-Za-z0-9]{2,5}(?:\.[A-Za-z0-9]{2,5})?/g;
+  const matches = ascii.match(filenameRegex) || [];
+  let nested = 0;
+  let playable = 0;
+  const samples = [];
+  matches.forEach((raw) => {
+    const normalized = raw.trim().toLowerCase();
+    if (!normalized) return;
+    samples.push(normalized);
+    if (VIDEO_FILE_EXTENSIONS.some((ext) => normalized.endsWith(ext))) {
+      playable += 1;
+      return;
+    }
+    if (isArchiveEntryName(normalized)) {
+      nested += 1;
+    }
+  });
+  return { nested, playable, samples };
+}
+
+function applyHeuristicArchiveHints(result, buffer, context = {}) {
+  if (!buffer || buffer.length === 0) {
+    return result;
+  }
+  const hints = analyzeBufferFilenames(buffer);
+  if (hints.nested > 0 && hints.playable === 0) {
+    const detailPatch = {
+      ...(result.details || {}),
+      nestedEntries: hints.nested,
+      heuristic: true,
+      sample: hints.samples[0] || null,
+      filename: context.filename || null,
+    };
+    if (result.status.startsWith('sevenzip')) {
+      return { status: 'sevenzip-nested-archive', details: detailPatch };
+    }
+    if (result.status === 'rar-stored' || result.status === 'rar5-unsupported') {
+      return { status: 'rar-nested-archive', details: detailPatch };
+    }
+  }
+  return result;
+}
+
 function getExtension(filename) {
   if (!filename) return undefined;
-  const lastDot = filename.lastIndexOf('.');
+  const lower = filename.toLowerCase();
+  const splitMatch = lower.match(/\.(rar|7z|zip)\.(?:part)?\d{2,3}$/);
+  if (splitMatch) return `.${splitMatch[1]}`;
+  const partMatch = lower.match(/\.part\d+\.(rar|7z|zip)$/);
+  if (partMatch) return `.${partMatch[1]}`;
+  const lastDot = lower.lastIndexOf('.');
   if (lastDot === -1) return undefined;
-  return filename.slice(lastDot).toLowerCase();
+  return lower.slice(lastDot);
 }
 
 function dedupeArchiveCandidates(archives) {
@@ -587,6 +672,29 @@ function canonicalArchiveKey(name) {
   key = key.replace(/\.part\d+\.rar$/i, '.rar');
   key = key.replace(/\.r\d{2}$/i, '.rar');
   return key;
+}
+
+function selectArchiveForInspection(archives) {
+  if (!Array.isArray(archives) || archives.length === 0) return null;
+  const candidates = archives
+    .filter((archive) => archive.segments && archive.segments.length > 0)
+    .map((archive) => ({
+      archive,
+      score: buildArchiveScore(archive),
+    }))
+    .sort((a, b) => b.score - a.score);
+  return candidates.length > 0 ? candidates[0].archive : null;
+}
+
+function buildArchiveScore(archive) {
+  const filename = archive.filename || guessFilenameFromSubject(archive.subject) || '';
+  let score = 0;
+  if (/\.rar$/i.test(filename)) score += 10;
+  if (/\.r\d{2}$/i.test(filename)) score += 9;
+  if (/\.part\d+\.rar$/i.test(filename)) score += 8;
+  if (/proof|sample|nfo/i.test(filename)) score -= 5;
+  if (isVideoFileName(filename)) score += 4;
+  return score;
 }
 
 async function inspectLocalArchive(file, archiveDirs) {
@@ -644,6 +752,10 @@ async function inspectArchiveViaNntp(file, ctx) {
   if (segments.length === 0) return { status: 'archive-no-segments' };
   const segmentId = segments[0]?.id;
   if (!segmentId) return { status: 'archive-no-segments' };
+  const effectiveFilename = file.filename || guessFilenameFromSubject(file.subject) || '';
+  if (isSplitSevenZipFilename(effectiveFilename)) {
+    return { status: 'sevenzip-unsupported', details: { reason: 'split-7z-multipart', filename: effectiveFilename } };
+  }
   return runWithClient(ctx.nntpPool, async (client) => {
     let statStart = null;
     if (currentMetrics) {
@@ -675,7 +787,20 @@ async function inspectArchiveViaNntp(file, ctx) {
     try {
       const bodyBuffer = await fetchSegmentBodyWithClient(client, segmentId);
       const decoded = decodeYencBuffer(bodyBuffer, ctx.config.maxDecodedBytes);
-      const archiveResult = inspectArchiveBuffer(decoded);
+      console.log('[NZB TRIAGE] Inspecting archive buffer', {
+        filename: file.filename,
+        subject: file.subject,
+        segmentId,
+        sampleBytes: decoded.slice(0, 8).toString('hex'),
+      });
+      let archiveResult = inspectArchiveBuffer(decoded);
+      archiveResult = applyHeuristicArchiveHints(archiveResult, decoded, { filename: effectiveFilename });
+      console.log('[NZB TRIAGE] Archive inspection via NNTP', {
+        status: archiveResult.status,
+        details: archiveResult.details,
+        filename: file.filename,
+        subject: file.subject,
+      });
       if (currentMetrics) {
         currentMetrics.bodySuccesses += 1;
         currentMetrics.bodyDurationMs += Date.now() - bodyStart;
@@ -705,6 +830,8 @@ function handleArchiveStatus(status, blockers, warnings) {
     case 'rar-encrypted':
     case 'rar-solid':
     case 'rar5-unsupported':
+    case 'rar-nested-archive':
+    case 'sevenzip-nested-archive':
     case 'sevenzip-unsupported':
       blockers.add(status);
       break;
@@ -747,18 +874,29 @@ function inspectArchiveBuffer(buffer) {
 
 function inspectRar4(buffer) {
   let offset = RAR4_SIGNATURE.length;
+  let storedDetails = null;
+  let nestedArchiveCount = 0;
+  let playableEntryFound = false;
 
   while (offset + 7 <= buffer.length) {
     const headerType = buffer[offset + 2];
     const headerFlags = buffer.readUInt16LE(offset + 3);
     const headerSize = buffer.readUInt16LE(offset + 5);
 
+    // console.log(`[RAR4] Type: ${headerType}, Size: ${headerSize}, Offset: ${offset}`);
+
     if (headerSize < 7) return { status: 'rar-corrupt-header' };
     if (offset + headerSize > buffer.length) return { status: 'rar-insufficient-data' };
+
+    let addSize = 0;
 
     if (headerType === 0x74) {
       let pos = offset + 7;
       if (pos + 11 > buffer.length) return { status: 'rar-insufficient-data' };
+      
+      const packSize = buffer.readUInt32LE(pos); 
+      addSize = packSize;
+      
       pos += 4; // pack size
       pos += 4; // unpacked size
       pos += 1; // host OS
@@ -770,28 +908,211 @@ function inspectRar4(buffer) {
       if (pos + 2 > buffer.length) return { status: 'rar-insufficient-data' };
       const nameSize = buffer.readUInt16LE(pos); pos += 2;
       pos += 4; // attributes
-      if (headerFlags & 0x0100) pos += 4; // high pack size
-      if (headerFlags & 0x0200) pos += 4; // high unpack size
+      if (headerFlags & 0x0100) {
+        if (pos + 8 > buffer.length) return { status: 'rar-insufficient-data' };
+        const highPackSize = buffer.readUInt32LE(pos);
+        addSize += highPackSize * 4294967296;
+        pos += 8; // high pack size (4) + high unpack size (4)
+      }
+      // if (headerFlags & 0x0200) pos += 4; // REMOVED: 0x0200 is UNICODE, not size
       if (pos + nameSize > buffer.length) return { status: 'rar-insufficient-data' };
       const name = buffer.slice(pos, pos + nameSize).toString('utf8').replace(/\0/g, '');
       const encrypted = Boolean(headerFlags & 0x0004);
       const solid = Boolean(headerFlags & 0x0010);
 
+      console.log(`[RAR4] Found entry: "${name}" (method: ${methodByte}, encrypted: ${encrypted}, solid: ${solid})`);
+
       if (encrypted) return { status: 'rar-encrypted', details: { name } };
       if (solid) return { status: 'rar-solid', details: { name } };
-      if (methodByte !== 0x30) return { status: 'rar-compressed', details: { name, method: methodByte } };
+      if (methodByte !== 0x30) {
+         // return { status: 'rar-compressed', details: { name, method: methodByte } };
+         // Don't return early! We need to scan all files to check for nested archives.
+         // But if we find a video file, we can stop and accept.
+      }
 
-      return { status: 'rar-stored', details: { name, method: methodByte } };
+      if (!storedDetails) {
+        storedDetails = { name, method: methodByte };
+      }
+      if (isVideoFileName(name)) {
+        playableEntryFound = true;
+      } else if (isArchiveEntryName(name)) {
+        nestedArchiveCount += 1;
+      }
     }
 
-    offset += headerSize;
+    offset += headerSize + addSize;
+  }
+
+  if (storedDetails) {
+    if (nestedArchiveCount > 0 && !playableEntryFound) {
+      console.log('[NZB TRIAGE] Detected nested archive (RAR4)', {
+        nestedEntries: nestedArchiveCount,
+        sample: storedDetails?.name,
+      });
+      return {
+        status: 'rar-nested-archive',
+        details: { nestedEntries: nestedArchiveCount },
+      };
+    }
+    console.log('[NZB TRIAGE] RAR4 archive marked stored', {
+      playableEntryFound,
+      nestedEntries: nestedArchiveCount,
+      sample: storedDetails?.name,
+    });
+    return { status: 'rar-stored', details: storedDetails };
   }
 
   return { status: 'rar-header-not-found' };
 }
 
 function inspectRar5(buffer) {
+  let offset = RAR5_SIGNATURE.length;
+  let nestedArchiveCount = 0;
+  let playableEntryFound = false;
+  let storedDetails = null;
+
+  while (offset < buffer.length) {
+    if (offset + 7 > buffer.length) break;
+
+    // const crc = buffer.readUInt32LE(offset);
+    let pos = offset + 4;
+
+    const sizeRes = readRar5Vint(buffer, pos);
+    if (!sizeRes) break;
+    const headerSize = sizeRes.value;
+    pos += sizeRes.bytes;
+
+    const typeRes = readRar5Vint(buffer, pos);
+    if (!typeRes) break;
+    const headerType = typeRes.value;
+    pos += typeRes.bytes;
+
+    const flagsRes = readRar5Vint(buffer, pos);
+    if (!flagsRes) break;
+    const headerFlags = flagsRes.value;
+    pos += flagsRes.bytes;
+
+    let extraAreaSize = 0;
+    let dataSize = 0;
+
+    if (headerType === 0x02 || headerType === 0x03) {
+      const hasExtraArea = (headerFlags & 0x0001) !== 0;
+      const hasData = (headerFlags & 0x0002) !== 0;
+
+      if (hasExtraArea) {
+        const extraRes = readRar5Vint(buffer, pos);
+        if (!extraRes) break;
+        extraAreaSize = extraRes.value;
+        pos += extraRes.bytes;
+      }
+
+      if (hasData) {
+        const dataRes = readRar5Vint(buffer, pos);
+        if (!dataRes) break;
+        dataSize = dataRes.value;
+        pos += dataRes.bytes;
+      }
+    }
+
+    // Correct offset calculation:
+    // Block = CRC(4) + Size(VINT) + HeaderData(headerSize) + Data(dataSize)
+    // We already advanced 'pos' past CRC and Size(VINT) to read the Type.
+    // Actually, 'headerSize' includes the Type, Flags, etc.
+    // So the block ends at: (offset + 4 + sizeRes.bytes) + headerSize + dataSize
+    const nextBlockOffset = offset + 4 + sizeRes.bytes + headerSize + dataSize;
+    
+    console.log(`[RAR5] Block type: ${headerType}, size: ${headerSize}, data: ${dataSize}, next: ${nextBlockOffset}`);
+
+    if (headerType === 0x02) { // File Header
+      const fileFlagsRes = readRar5Vint(buffer, pos);
+      if (fileFlagsRes) {
+        pos += fileFlagsRes.bytes;
+        const fileFlags = fileFlagsRes.value;
+
+        const unpackSizeRes = readRar5Vint(buffer, pos);
+        if (unpackSizeRes) {
+          pos += unpackSizeRes.bytes;
+
+          const attrRes = readRar5Vint(buffer, pos);
+          if (attrRes) {
+            pos += attrRes.bytes;
+
+            if (fileFlags & 0x0002) pos += 4; // MTime
+            if (fileFlags & 0x0004) pos += 4; // CRC
+
+            const compInfoRes = readRar5Vint(buffer, pos);
+            if (compInfoRes) {
+              pos += compInfoRes.bytes;
+
+              const hostOsRes = readRar5Vint(buffer, pos);
+              if (hostOsRes) {
+                pos += hostOsRes.bytes;
+
+                const nameLenRes = readRar5Vint(buffer, pos);
+                if (nameLenRes) {
+                  pos += nameLenRes.bytes;
+                  const nameLen = nameLenRes.value;
+
+                  if (pos + nameLen <= buffer.length) {
+                    const name = buffer.slice(pos, pos + nameLen).toString('utf8');
+                    console.log(`[RAR5] Found entry: "${name}"`);
+
+                    if (!storedDetails) storedDetails = { name };
+
+                    if (isVideoFileName(name)) {
+                      playableEntryFound = true;
+                    } else if (isArchiveEntryName(name)) {
+                      nestedArchiveCount += 1;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    offset = nextBlockOffset;
+  }
+
+  if (storedDetails) {
+    if (nestedArchiveCount > 0 && !playableEntryFound) {
+      console.log('[NZB TRIAGE] Detected nested archive (RAR5)', {
+        nestedEntries: nestedArchiveCount,
+        sample: storedDetails?.name,
+      });
+      return {
+        status: 'rar-nested-archive',
+        details: { nestedEntries: nestedArchiveCount },
+      };
+    }
+    console.log('[NZB TRIAGE] RAR5 archive marked stored', {
+      playableEntryFound,
+      nestedEntries: nestedArchiveCount,
+      sample: storedDetails?.name,
+    });
+    return { status: 'rar-stored', details: storedDetails };
+  }
+
   return { status: 'rar-stored', details: { note: 'rar5-header-assumed-stored' } };
+}
+
+function readRar5Vint(buffer, offset) {
+  let result = 0;
+  let shift = 0;
+  let bytes = 0;
+  while (offset + bytes < buffer.length) {
+    const b = buffer[offset + bytes];
+    bytes += 1;
+    result += (b & 0x7F) * Math.pow(2, shift);
+    shift += 7;
+    if ((b & 0x80) === 0) {
+      return { value: result, bytes };
+    }
+    if (shift > 50) break;
+  }
+  return null;
 }
 
 function inspectSevenZip(buffer) {
