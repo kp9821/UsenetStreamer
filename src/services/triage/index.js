@@ -782,11 +782,11 @@ async function inspectArchiveViaNntp(file, ctx) {
     }
 
     if (isSevenZip) {
-      console.log('[NZB TRIAGE] Skipping 7z archive inspection (STAT passed, body skipped)', {
-        filename: file.filename,
-        subject: file.subject,
-        segmentId,
-      });
+      // console.log('[NZB TRIAGE] Skipping 7z archive inspection (STAT passed, body skipped)', {
+      //   filename: file.filename,
+      //   subject: file.subject,
+      //   segmentId,
+      // });
       return {
         status: 'sevenzip-untested',
         details: { reason: '7z-skip-body', filename: effectiveFilename },
@@ -803,20 +803,20 @@ async function inspectArchiveViaNntp(file, ctx) {
     try {
       const bodyBuffer = await fetchSegmentBodyWithClient(client, segmentId);
       const decoded = decodeYencBuffer(bodyBuffer, ctx.config.maxDecodedBytes);
-      console.log('[NZB TRIAGE] Inspecting archive buffer', {
-        filename: file.filename,
-        subject: file.subject,
-        segmentId,
-        sampleBytes: decoded.slice(0, 8).toString('hex'),
-      });
+      // console.log('[NZB TRIAGE] Inspecting archive buffer', {
+      //   filename: file.filename,
+      //   subject: file.subject,
+      //   segmentId,
+      //   sampleBytes: decoded.slice(0, 8).toString('hex'),
+      // });
       let archiveResult = inspectArchiveBuffer(decoded);
       archiveResult = applyHeuristicArchiveHints(archiveResult, decoded, { filename: effectiveFilename });
-      console.log('[NZB TRIAGE] Archive inspection via NNTP', {
-        status: archiveResult.status,
-        details: archiveResult.details,
-        filename: file.filename,
-        subject: file.subject,
-      });
+      // console.log('[NZB TRIAGE] Archive inspection via NNTP', {
+      //   status: archiveResult.status,
+      //   details: archiveResult.details,
+      //   filename: file.filename,
+      //   subject: file.subject,
+      // });
       if (currentMetrics) {
         currentMetrics.bodySuccesses += 1;
         currentMetrics.bodyDurationMs += Date.now() - bodyStart;
@@ -940,7 +940,7 @@ function inspectRar4(buffer) {
       const encrypted = Boolean(headerFlags & 0x0004);
       const solid = Boolean(headerFlags & 0x0010);
 
-      console.log(`[RAR4] Found entry: "${name}" (method: ${methodByte}, encrypted: ${encrypted}, solid: ${solid})`);
+      // console.log(`[RAR4] Found entry: "${name}" (method: ${methodByte}, encrypted: ${encrypted}, solid: ${solid})`);
 
       if (encrypted) return { status: 'rar-encrypted', details: { name } };
       if (solid) return { status: 'rar-solid', details: { name } };
@@ -965,20 +965,20 @@ function inspectRar4(buffer) {
 
   if (storedDetails) {
     if (nestedArchiveCount > 0 && !playableEntryFound) {
-      console.log('[NZB TRIAGE] Detected nested archive (RAR4)', {
-        nestedEntries: nestedArchiveCount,
-        sample: storedDetails?.name,
-      });
+      // console.log('[NZB TRIAGE] Detected nested archive (RAR4)', {
+      //   nestedEntries: nestedArchiveCount,
+      //   sample: storedDetails?.name,
+      // });
       return {
         status: 'rar-nested-archive',
         details: { nestedEntries: nestedArchiveCount },
       };
     }
-    console.log('[NZB TRIAGE] RAR4 archive marked stored', {
-      playableEntryFound,
-      nestedEntries: nestedArchiveCount,
-      sample: storedDetails?.name,
-    });
+    // console.log('[NZB TRIAGE] RAR4 archive marked stored', {
+    //   playableEntryFound,
+    //   nestedEntries: nestedArchiveCount,
+    //   sample: storedDetails?.name,
+    // });
     return { status: 'rar-stored', details: storedDetails };
   }
 
@@ -1041,7 +1041,7 @@ function inspectRar5(buffer) {
     // So the block ends at: (offset + 4 + sizeRes.bytes) + headerSize + dataSize
     const nextBlockOffset = offset + 4 + sizeRes.bytes + headerSize + dataSize;
     
-    console.log(`[RAR5] Block type: ${headerType}, size: ${headerSize}, data: ${dataSize}, next: ${nextBlockOffset}`);
+    // console.log(`[RAR5] Block type: ${headerType}, size: ${headerSize}, data: ${dataSize}, next: ${nextBlockOffset}`);
 
     if (headerType === 0x02) { // File Header
       const fileFlagsRes = readRar5Vint(buffer, pos);
@@ -1075,7 +1075,7 @@ function inspectRar5(buffer) {
 
                   if (pos + nameLen <= buffer.length) {
                     const name = buffer.slice(pos, pos + nameLen).toString('utf8');
-                    console.log(`[RAR5] Found entry: "${name}"`);
+                    // console.log(`[RAR5] Found entry: "${name}"`);
 
                     if (!storedDetails) storedDetails = { name };
 
@@ -1098,20 +1098,20 @@ function inspectRar5(buffer) {
 
   if (storedDetails) {
     if (nestedArchiveCount > 0 && !playableEntryFound) {
-      console.log('[NZB TRIAGE] Detected nested archive (RAR5)', {
-        nestedEntries: nestedArchiveCount,
-        sample: storedDetails?.name,
-      });
+      // console.log('[NZB TRIAGE] Detected nested archive (RAR5)', {
+      //   nestedEntries: nestedArchiveCount,
+      //   sample: storedDetails?.name,
+      // });
       return {
         status: 'rar-nested-archive',
         details: { nestedEntries: nestedArchiveCount },
       };
     }
-    console.log('[NZB TRIAGE] RAR5 archive marked stored', {
-      playableEntryFound,
-      nestedEntries: nestedArchiveCount,
-      sample: storedDetails?.name,
-    });
+    // console.log('[NZB TRIAGE] RAR5 archive marked stored', {
+    //   playableEntryFound,
+    //   nestedEntries: nestedArchiveCount,
+    //   sample: storedDetails?.name,
+    // });
     return { status: 'rar-stored', details: storedDetails };
   }
 

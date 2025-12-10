@@ -69,7 +69,7 @@ const STREAM_HIGH_WATER_MARK = (() => {
 })();
 const FAILURE_VIDEO_PATH = path.resolve(__dirname, '../../assets', 'failure_video.mp4');
 const VIDEO_TYPE_FAILURE_PATH = path.resolve(__dirname, '../../assets', 'video_type_failure.mp4');
-const ADDON_VERSION = '1.5.1';
+const ADDON_VERSION = '1.6.0';
 
 function ensureNzbdavConfigured() {
   if (!NZBDAV_URL) {
@@ -882,7 +882,7 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
       console.warn('[NZBDAV] Stream closed early by client');
       return;
     }
-    console.error('[NZBDAV] Error while piping stream:', error.message);
+    // console.error('[NZBDAV] Error while piping stream:', error.message);
     throw error;
   }
 }

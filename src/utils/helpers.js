@@ -183,6 +183,7 @@ function triageStatusRank(status) {
       return 4;
     case 'verified':
       return 3;
+    case 'unverified_7z':
     case 'unverified':
       return 2;
     case 'pending':

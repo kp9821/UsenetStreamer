@@ -850,6 +850,7 @@
   }
 
   const healthToggle = configForm.querySelector('input[name="NZB_TRIAGE_ENABLED"]');
+  const prefetchFirstVerifiedToggle = configForm.querySelector('input[name="NZB_TRIAGE_PREFETCH_FIRST_VERIFIED"]');
   const healthRequiredFields = Array.from(configForm.querySelectorAll('[data-health-required]'));
   const triageCandidateSelect = configForm.querySelector('select[name="NZB_TRIAGE_MAX_CANDIDATES"]');
   const triageConnectionsInput = configForm.querySelector('input[name="NZB_TRIAGE_MAX_CONNECTIONS"]');
@@ -914,6 +915,11 @@
       managerFields.forEach((field) => field.classList.toggle('hidden', managerValue === 'none'));
     }
     syncSaveGuard();
+  }
+
+  function syncPrefetchToggle() {
+    // Currently no dependencies; placeholder for future state-based enabling/disabling
+    return Boolean(prefetchFirstVerifiedToggle);
   }
 
   function syncStreamingModeControls() {

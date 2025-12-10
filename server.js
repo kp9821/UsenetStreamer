@@ -43,7 +43,7 @@ const tmdbService = require('./src/services/tmdb');
 
 const app = express();
 let currentPort = Number(process.env.PORT || 7000);
-const ADDON_VERSION = '1.5.1';
+const ADDON_VERSION = '1.6.0';
 const DEFAULT_ADDON_NAME = 'UsenetStreamer';
 let serverInstance = null;
 const SERVER_HOST = '0.0.0.0';
@@ -546,6 +546,7 @@ let TRIAGE_STAT_SAMPLE_COUNT = toPositiveInt(process.env.NZB_TRIAGE_STAT_SAMPLE_
 let TRIAGE_ARCHIVE_SAMPLE_COUNT = toPositiveInt(process.env.NZB_TRIAGE_ARCHIVE_SAMPLE_COUNT, 1);
 let TRIAGE_REUSE_POOL = toBoolean(process.env.NZB_TRIAGE_REUSE_POOL, true);
 let TRIAGE_NNTP_KEEP_ALIVE_MS = toPositiveInt(process.env.NZB_TRIAGE_NNTP_KEEP_ALIVE_MS, 0);
+let TRIAGE_PREFETCH_FIRST_VERIFIED = toBoolean(process.env.NZB_TRIAGE_PREFETCH_FIRST_VERIFIED, false);
 
 let TRIAGE_BASE_OPTIONS = {
   archiveDirs: TRIAGE_ARCHIVE_DIRS,
@@ -584,7 +585,7 @@ function maybePrewarmSharedNntpPool() {
       // console.log('[NZB TRIAGE] Pre-warmed NNTP pool with shared configuration');
     })
     .catch((err) => {
-      console.warn('[NZB TRIAGE] Unable to pre-warm NNTP pool', err?.message || err);
+      // console.warn('[NZB TRIAGE] Unable to pre-warm NNTP pool', err?.message || err);
     });
 }
 
@@ -595,7 +596,7 @@ function triggerRequestTriagePrewarm(reason = 'request') {
   const options = buildSharedPoolOptions();
   if (!options) return null;
   return preWarmNntpPool(options).catch((err) => {
-    console.warn(`[NZB TRIAGE] Unable to pre-warm NNTP pool (${reason})`, err?.message || err);
+    // console.warn(`[NZB TRIAGE] Unable to pre-warm NNTP pool (${reason})`, err?.message || err);
   });
 }
 
@@ -610,7 +611,7 @@ function restartSharedPoolMonitor() {
   const intervalMs = Math.max(30000, TRIAGE_NNTP_KEEP_ALIVE_MS || 120000);
   sharedPoolMonitorTimer = setInterval(() => {
     evictStaleSharedNntpPool().catch((err) => {
-      console.warn('[NZB TRIAGE] Failed to evict stale NNTP pool', err?.message || err);
+      // console.warn('[NZB TRIAGE] Failed to evict stale NNTP pool', err?.message || err);
     });
   }, intervalMs);
   if (typeof sharedPoolMonitorTimer.unref === 'function') {
@@ -776,6 +777,7 @@ const ADMIN_CONFIG_KEYS = [
   'NZB_TRIAGE_SERIALIZED_INDEXERS',
   'NZB_TRIAGE_DOWNLOAD_CONCURRENCY',
   'NZB_TRIAGE_MAX_CONNECTIONS',
+  'NZB_TRIAGE_PREFETCH_FIRST_VERIFIED',
   'NZB_TRIAGE_MAX_PARALLEL_NZBS',
   'NZB_TRIAGE_STAT_SAMPLE_COUNT',
   'NZB_TRIAGE_ARCHIVE_SAMPLE_COUNT',
@@ -1294,6 +1296,13 @@ async function streamHandler(req, res) {
               tvdb: meta?.ids?.tvdb || meta?.tvdb_id,
               tmdb: meta?.ids?.tmdb || meta?.tmdb_id
             });
+            console.log('[CINEMETA] Received metadata fields', {
+              title: meta?.title,
+              name: meta?.name,
+              originalTitle: meta?.originalTitle,
+              year: meta?.year,
+              released: meta?.released
+            });
           } else {
             console.warn(`[CINEMETA] No metadata payload returned`);
           }
@@ -1397,8 +1406,8 @@ async function streamHandler(req, res) {
 
     let movieTitle = pickFirstDefined(
       ...collectValues(
-        (src) => src?.title,
         (src) => src?.name,
+        (src) => src?.title,
         (src) => src?.originalTitle,
         (src) => src?.original_title
       )
@@ -1425,8 +1434,6 @@ async function streamHandler(req, res) {
         releaseYear = specialYear;
       }
     }
-
-    console.log('[REQUEST] Resolved title/year', { movieTitle, releaseYear, elapsedMs: Date.now() - requestStartTs });
 
     let searchType;
     if (type === 'series') {
@@ -1535,6 +1542,32 @@ async function streamHandler(req, res) {
         }
       }
 
+      if (!movieTitle) {
+        movieTitle = pickFirstDefined(
+          ...collectValues(
+            (src) => src?.name,
+            (src) => src?.title,
+            (src) => src?.originalTitle,
+            (src) => src?.original_title
+          )
+        );
+      }
+
+      if (!releaseYear) {
+        releaseYear = extractYear(
+          pickFirstDefined(
+            ...collectValues(
+              (src) => src?.year,
+              (src) => src?.releaseYear,
+              (src) => src?.released,
+              (src) => src?.releaseInfo?.year
+            )
+          )
+        );
+      }
+
+      console.log('[REQUEST] Resolved title/year', { movieTitle, releaseYear, elapsedMs: Date.now() - requestStartTs });
+
       // Continue with text-based searches using TMDb titles
       const textQueryParts = [];
       let tmdbLocalizedQuery = null;
@@ -1554,8 +1587,11 @@ async function streamHandler(req, res) {
 
       if (shouldAddTextSearch) {
         const textQueryCandidate = textQueryParts.join(' ').trim();
+        const isEpisodeOnly = /^s\d{2}e\d{2}$/i.test(textQueryCandidate) && !movieTitle;
         const isYearOnly = /^\d{4}$/.test(textQueryCandidate);
-        if (strictTextMode && isYearOnly && (!movieTitle || !movieTitle.trim())) {
+        if (strictTextMode && isEpisodeOnly) {
+          console.log(`${INDEXER_LOG_PREFIX} Skipping episode-only text plan (no title)`);
+        } else if (strictTextMode && isYearOnly && (!movieTitle || !movieTitle.trim())) {
           console.log(`${INDEXER_LOG_PREFIX} Skipping year-only text plan (strict mode, no title)`);
         } else {
         // Only use fallback identifier if we don't have TMDb titles coming
@@ -2039,7 +2075,7 @@ async function streamHandler(req, res) {
       // console.log('[LANGUAGE] Top stream ordering sample', sample);
     };
     logTopLanguages();
-    const allowedCacheStatuses = new Set(['verified', 'blocked']);
+    const allowedCacheStatuses = new Set(['verified', 'blocked', 'unverified_7z']);
     const requestedDisable = triageOverrides.disabled === true;
     const requestedEnable = triageOverrides.enabled === true;
     const overrideIndexerTokens = (triageOverrides.indexers && triageOverrides.indexers.length > 0)
@@ -2072,7 +2108,7 @@ async function streamHandler(req, res) {
       ? TRIAGE_SERIALIZED_INDEXERS
       : combinedHealthTokens;
     const healthIndexerSet = new Set((combinedHealthTokens || []).map((token) => normalizeIndexerToken(token)).filter(Boolean));
-    console.log(`[NZB TRIAGE] Easynews health check mode: ${EASYNEWS_TREAT_AS_INDEXER ? 'ENABLED' : 'DISABLED'}`);
+    // console.log(`[NZB TRIAGE] Easynews health check mode: ${EASYNEWS_TREAT_AS_INDEXER ? 'ENABLED' : 'DISABLED'}`);
     
     const triagePool = healthIndexerSet.size > 0
       ? finalNzbResults.filter((result) => {
@@ -2082,13 +2118,13 @@ async function streamHandler(req, res) {
           }
           // Include Easynews if flag is enabled
           if (EASYNEWS_TREAT_AS_INDEXER && result._sourceType === 'easynews') {
-            console.log(`[NZB TRIAGE] Including Easynews result in triage pool: ${result.title}`);
+            // console.log(`[NZB TRIAGE] Including Easynews result in triage pool: ${result.title}`);
             return true;
           }
           return false;
         })
       : [];
-    console.log(`[NZB TRIAGE] Triage pool size: ${triagePool.length} (from ${finalNzbResults.length} total results)`);
+    // console.log(`[NZB TRIAGE] Triage pool size: ${triagePool.length} (from ${finalNzbResults.length} total results)`);
     const getDecisionStatus = (candidate) => {
       const decision = triageDecisions.get(candidate.downloadUrl);
       return decision && decision.status ? String(decision.status).toLowerCase() : null;
@@ -2129,20 +2165,23 @@ async function streamHandler(req, res) {
       }
       return false;
     };
+    const categoryForType = STREAMING_MODE !== 'native' ? nzbdavService.getNzbdavCategory(type) : null;
     const triageCandidatesToRun = triageEligibleResults.filter((candidate) => !candidateHasConclusiveDecision(candidate));
     const shouldSkipTriageForRequest = requestLacksIdentifiers;
     const shouldAttemptTriage = triageCandidatesToRun.length > 0 && !requestedDisable && !shouldSkipTriageForRequest && (requestedEnable || TRIAGE_ENABLED);
     let triageOutcome = null;
     let triageCompleteForCache = !shouldAttemptTriage;
+    let prefetchCandidate = null;
+    let prefetchNzbPayload = null;
 
     if (shouldAttemptTriage) {
       if (!TRIAGE_NNTP_CONFIG) {
-        console.warn('[NZB TRIAGE] Skipping health checks because NNTP configuration is missing');
+        // console.warn('[NZB TRIAGE] Skipping health checks because NNTP configuration is missing');
       } else {
         const triageLogger = (level, message, context) => {
           const logFn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
-          if (context) logFn(`[NZB TRIAGE] ${message}`, context);
-          else logFn(`[NZB TRIAGE] ${message}`);
+          // if (context) logFn(`[NZB TRIAGE] ${message}`, context);
+          // else logFn(`[NZB TRIAGE] ${message}`);
         };
         const triageOptions = {
           allowedIndexerIds: combinedHealthTokens,
@@ -2193,11 +2232,11 @@ async function streamHandler(req, res) {
             // console.log('[NZB TRIAGE] No decisions were produced by the triage runner');
           }
         } catch (triageError) {
-          console.warn(`[NZB TRIAGE] Health check failed: ${triageError.message}`);
+          // console.warn(`[NZB TRIAGE] Health check failed: ${triageError.message}`);
         }
       }
     } else if (shouldSkipTriageForRequest && TRIAGE_ENABLED && !requestedDisable) {
-      console.log('[NZB TRIAGE] Skipping health checks for non-ID request (no IMDb/TVDB identifier)');
+      // console.log('[NZB TRIAGE] Skipping health checks for non-ID request (no IMDb/TVDB identifier)');
     }
 
     if (shouldAttemptTriage) {
@@ -2217,6 +2256,14 @@ async function streamHandler(req, res) {
             size: candidate.size,
             fileName: candidate.title,
           });
+            if (!prefetchCandidate && STREAMING_MODE !== 'native') {
+              prefetchCandidate = {
+                downloadUrl: candidate.downloadUrl,
+                title: candidate.title,
+                category: categoryForType,
+                requestedEpisode,
+              };
+            }
         }
         if (decision && decision.nzbPayload) {
           delete decision.nzbPayload;
@@ -2229,6 +2276,29 @@ async function streamHandler(req, res) {
         }
       });
     }
+
+      // If prefetch is enabled, capture first verified NZB payload even when triage cache completion criteria aren’t met
+      if (TRIAGE_PREFETCH_FIRST_VERIFIED && STREAMING_MODE !== 'native' && !prefetchCandidate && triageDecisions && triageDecisions.size > 0) {
+        for (const candidate of triageEligibleResults) {
+          const decision = triageDecisions.get(candidate.downloadUrl);
+          if (decision && decision.status === 'verified' && typeof decision.nzbPayload === 'string') {
+            prefetchCandidate = {
+              downloadUrl: candidate.downloadUrl,
+              title: candidate.title,
+              category: categoryForType,
+              requestedEpisode,
+            };
+            prefetchNzbPayload = decision.nzbPayload;
+            cache.cacheVerifiedNzbPayload(candidate.downloadUrl, decision.nzbPayload, {
+              title: decision.title || candidate.title,
+              size: candidate.size,
+              fileName: candidate.title,
+            });
+            delete decision.nzbPayload;
+            break;
+          }
+        }
+      }
 
     // NZBDav cache cleanup is now handled automatically by the cache module
 
@@ -2253,7 +2323,6 @@ async function streamHandler(req, res) {
       : null;
 
     // Skip NZBDav history fetching in native streaming mode
-    const categoryForType = STREAMING_MODE !== 'native' ? nzbdavService.getNzbdavCategory(type) : null;
     let historyByTitle = new Map();
     if (STREAMING_MODE !== 'native') {
       try {
@@ -2340,20 +2409,20 @@ async function streamHandler(req, res) {
         const triageStatus = triageInfo?.status || (triageApplied ? 'unknown' : 'not-run');
         if (INDEXER_HIDE_BLOCKED_RESULTS && triageStatus === 'blocked') {
           if (triageInfo) {
-            console.log('[STREMIO][TRIAGE] Hiding blocked stream', {
-              title: result.title,
-              downloadUrl: result.downloadUrl,
-              indexer: result.indexer,
-              blockers: triageInfo.blockers || [],
-              warnings: triageInfo.warnings || [],
-              archiveFindings: triageInfo.archiveFindings || [],
-            });
+            // console.log('[STREMIO][TRIAGE] Hiding blocked stream', {
+            //   title: result.title,
+            //   downloadUrl: result.downloadUrl,
+            //   indexer: result.indexer,
+            //   blockers: triageInfo.blockers || [],
+            //   warnings: triageInfo.warnings || [],
+            //   archiveFindings: triageInfo.archiveFindings || [],
+            // });
           } else {
-            console.log('[STREMIO][TRIAGE] Hiding blocked stream with missing triageInfo', {
-              title: result.title,
-              downloadUrl: result.downloadUrl,
-              indexer: result.indexer,
-            });
+            // console.log('[STREMIO][TRIAGE] Hiding blocked stream with missing triageInfo', {
+            //   title: result.title,
+            //   downloadUrl: result.downloadUrl,
+            //   indexer: result.indexer,
+            // });
           }
           return;
         }
@@ -2413,21 +2482,21 @@ async function streamHandler(req, res) {
         }
 
         if (triageApplied || triageDerivedFromTitle) {
-          console.log('[STREMIO][TRIAGE] Stream decision', {
-            title: result.title,
-            downloadUrl: result.downloadUrl,
-            indexer: result.indexer,
-            triageStatus,
-            triageApplied,
-            triageDerivedFromTitle,
-            blockers: triageInfo?.blockers || [],
-            warnings: triageInfo?.warnings || [],
-            archiveFindings,
-            archiveCheckStatus,
-            missingArticlesStatus,
-            timedOut: Boolean(triageOutcome?.timedOut),
-            decisionSource: triageApplied ? 'direct' : 'title-fallback',
-          });
+          // console.log('[STREMIO][TRIAGE] Stream decision', {
+          //   title: result.title,
+          //   downloadUrl: result.downloadUrl,
+          //   indexer: result.indexer,
+          //   triageStatus,
+          //   triageApplied,
+          //   triageDerivedFromTitle,
+          //   blockers: triageInfo?.blockers || [],
+          //   warnings: triageInfo?.warnings || [],
+          //   archiveFindings,
+          //   archiveCheckStatus,
+          //   missingArticlesStatus,
+          //   timedOut: Boolean(triageOutcome?.timedOut),
+          //   decisionSource: triageApplied ? 'direct' : 'title-fallback',
+          // });
         }
 
         if (historySlot?.nzoId) {
@@ -2620,6 +2689,23 @@ async function streamHandler(req, res) {
     }
 
     res.json(responsePayload);
+
+    if (TRIAGE_PREFETCH_FIRST_VERIFIED && STREAMING_MODE !== 'native' && prefetchCandidate) {
+      setImmediate(async () => {
+        try {
+          const cachedEntry = cache.getVerifiedNzbCacheEntry(prefetchCandidate.downloadUrl);
+          await nzbdavService.addNzbToNzbdav({
+            downloadUrl: prefetchCandidate.downloadUrl,
+            cachedEntry,
+            category: prefetchCandidate.category,
+            jobLabel: prefetchCandidate.title,
+          });
+          console.log('[NZBDAV] Prefetched first verified NZB to NZBDav queue');
+        } catch (prefetchError) {
+          console.warn('[NZBDAV] Prefetch of first verified NZB failed:', prefetchError.message);
+        }
+      });
+    }
   } catch (error) {
     console.error('[ERROR] Processing failed:', error.message);
     res.status(error.response?.status || 500).json({
@@ -2775,7 +2861,7 @@ async function handleNzbdavStream(req, res) {
     }
 
     const statusCode = error.response?.status || 502;
-    console.error('[NZBDAV] Stream proxy error:', error.message);
+    // console.error('[NZBDAV] Stream proxy error:', error.message);
     if (!res.headersSent) {
       res.status(statusCode).json({ error: error.message });
     } else {

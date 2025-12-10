@@ -128,6 +128,17 @@ function summarizeDecision(decision) {
     }
   }
 
+  // Flag unverified outcomes that are 7z-only so downstream caching can treat them as complete
+  if (status === 'unverified') {
+    const sevenZipFlag = archiveFindings.some((finding) => {
+      const label = String(finding?.status || '').toLowerCase();
+      return label.startsWith('sevenzip');
+    }) || warnings.some((warning) => String(warning || '').toLowerCase().startsWith('sevenzip'));
+    if (sevenZipFlag) {
+      status = 'unverified_7z';
+    }
+  }
+
   return {
     status,
     blockers,
